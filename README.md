@@ -1,9 +1,21 @@
-# YouTube 频道 → Gemini 网页笔记本
+# YouTube 频道 → Gemini 网页笔记本 | YouTube Channels → Gemini Notebooks
+
+[中文](#中文) · [English](#english)
+
+## 中文
 
 Windows 本地元数据队列 + 已安装 Codex 浏览器自动化工作器。
 不使用 Gemini API，不下载视频/字幕，本地不保存摘要。
 每个频道对应 Gemini 原生笔记本，每条视频独立聊天；总结完成后改名为
 `YYYYMMDD-不超过5个汉字主题词-完整原视频标题`，刷新笔记本并重新打开确认后才标为完成。
+指定博主的公开内容按频道归档在 Gemini，便于逐条查找并沉淀个人知识库；摘要不额外导出到本地知识库。
+
+### 特点
+
+- **指定博主与批量总结：**添加频道链接，首次全量采集 `/videos`、`/shorts`、`/streams`，按频道和视频 ID 去重，连续分批总结历史视频。
+- **增量自动更新：**Windows 本地时间每周一、周四 08:30 检查并总结新视频；周一校验完整清单。每轮所有频道合计最多 20 次新提交，新视频优先，多个频道轮转。
+- **自动命名与笔记本归档：**总结完成后选 1–5 个汉字主题词，保留完整原标题；刷新笔记本并重新打开，核对成功才标为完成。
+- **命令驱动、断点续跑：**本地 CLI 管理采集和队列，Codex 工作器操作 Gemini 网页。不确定的提交先核对已有聊天，无法确认便暂停，避免重复发送。
 
 ## 使用条件
 
@@ -86,3 +98,54 @@ git diff --cached --stat
 - [yt-dlp 官方选项](https://github.com/yt-dlp/yt-dlp#usage-and-options)
 - [Google：Gemini Notebooks 功能与保存条件](https://support.google.com/gemini/answer/16972047)
 - [OpenAI：本机定时任务](https://learn.chatgpt.com/docs/automations?surface=app)
+
+## English
+
+Collect public videos from selected YouTube creators and summarize them into Gemini web Notebooks as a searchable personal knowledge base. Each channel gets one native Notebook and each video gets its own chat. A Windows local Python queue coordinates the installed Codex Browser Automation / Computer Use worker. The tool does not use the Gemini API, download video, audio, or subtitles, or store summaries locally.
+
+### Features
+
+- **Creator-specific batch summaries:** Add a channel URL. yt-dlp inventories public metadata from `/videos`, `/shorts`, and `/streams`, deduplicated by `(channel_id, video_id)`. The first run collects the full history and continues in batches. There is no overall 20-video history cap; actual progress depends on Gemini limits, source availability, and safe pauses.
+- **Automatic incremental updates:** Check for and summarize new videos every Monday and Thursday at 08:30 Windows local time. Monday also verifies the full channel inventory. Each scheduled round allows at most 20 new submissions across all channels, prioritizes new videos, and rotates between channels.
+- **Automatic naming and archiving:** Choose a one-to-five-Chinese-character topic only after a summary is complete. Rename the chat `YYYYMMDD-topic-full original video title`, refresh the Notebook, reopen the chat from its list, and verify it before marking the task complete. Gemini Notebooks are the archive; summaries are not exported to a local knowledge base.
+- **Command-driven, resumable queue:** `ytg.py` manages channels, inventory, and minimal task state. The Codex worker follows the [worker procedure](docs/WORKER.md) in Gemini's web UI. It reconciles uncertain submissions against existing chats or safely pauses instead of resending.
+- **Local state separation:** The SQLite task database defaults to `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`, outside the synced repository. Summaries remain in Gemini; cookies, tokens, and browser profiles are neither read nor exported.
+
+### Requirements and setup
+
+Requires Windows, Python 3.11+, yt-dlp, a running Codex desktop app with Browser Automation / Computer Use, and a signed-in Gemini account with working Notebooks and YouTube content access. The computer, Codex, and browser must stay running and connected. Gemini features and limits may change. This is not a standalone Python browser bot, and the upstream extension is not installed for the production queue.
+
+Run the following from the repository root. First have the worker create and check a real Gemini Notebook, then register its URL. The current user's channel is already registered locally; do not initialize a second task database.
+
+```powershell
+python -m unittest discover -s tests -v
+python ytg.py add https://www.youtube.com/@wuyuesanren
+python ytg.py notebook CHANNEL_ID https://gemini.google.com/notebook/NOTEBOOK_ID
+python ytg.py scan --full
+python ytg.py status
+```
+
+Use `python ytg.py --db <database-path> status` for another non-synced location. The `begin/next/metadata/step/end` commands manage batches; `next` alone does not send anything to Gemini. See the [worker procedure](docs/WORKER.md) for manual processing and recovery.
+
+```powershell
+python ytg.py status
+python ytg.py pause quota
+```
+
+Resume only after the user confirms a fault or limit has cleared: `python ytg.py resume --confirmed`. Scheduled runs never resume on their own. The web UI has no transaction or idempotency key, so exactly-once delivery cannot be guaranteed. When a submission cannot be confirmed, processing pauses rather than risking a duplicate. Private, removed, or unreadable videos retain their task reason and any existing chat mapping; the worker does not invent summaries.
+
+### Verification, attribution, and publishing
+
+The [validation record](docs/VALIDATION.md) separates live Gemini end-to-end checks, automated tests, and longer-term behavior that has not yet been verified. Three successful sample videos do not mean the whole historical inventory is summarized. Sustained history processing and future scheduled triggers still need observation.
+
+This project builds on the YouTube-link-to-Gemini workflow from [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome). Its source and MIT license remain under [vendor/youtube-summarizer-chrome](vendor/youtube-summarizer-chrome/); see [attribution](NOTICE.md). The production queue uses the installed Codex web automation, not the upstream extension, and does not track upstream updates.
+
+Code is pushed to the user's private repository only after tests pass. Important changes stay in a PR for user review; they are not merged automatically. Before pushing:
+
+```powershell
+python -m unittest discover -s tests -v
+python publish_check.py
+git diff --cached --stat
+```
+
+Stage only explicit code, test, and documentation paths. Never upload the task database, logs, screenshots, summaries, cookies, tokens, browser data, or private Notebook URLs. Scheduled video runs do not commit code.

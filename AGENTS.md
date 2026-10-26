@@ -6,7 +6,7 @@
 - 浏览器操作只使用当前已安装、已授权的 Browser Automation / Computer Use。
 - 不使用 Gemini API、私有 RPC、远程调试端口、新扩展或新浏览器配置文件。
 - yt-dlp 仅提取公开元数据。禁止下载视频、音频、字幕；禁止读取或导出 Cookie、Token、浏览器配置文件。
-- 唯一持久任务记录是 runtime/tasks.sqlite3。不保存摘要、网页快照、转写或日志文件。
+- 唯一持久任务记录是本机 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`。不保存摘要、网页快照、转写或日志文件。
 - 严格执行 ytg.py 状态机。网页操作与 SQLite 无法原子提交，所以遇不确定结果必须停在 uncertain 并核对既有聊天，禁止自动重新发送。
 - 每条视频独立聊天、频道对应固定原生笔记本。不得使用扩展文件夹替代。
 - 提交、生成、命名、保存、刷新、从笔记本重新打开逐项验证，不以 Gemini 自述保存成功为证据。
