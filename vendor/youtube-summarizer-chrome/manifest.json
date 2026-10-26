@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Auto YouTube Summarizer",
+  "version": "0.1",
+  "description": "Automatically types and sends prompts to Gemini.",
+  "permissions": [
+    "contextMenus",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "commands": {
+    "summarize-video": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Summarize the YouTube video"
+    }
+  }
+}
