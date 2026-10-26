@@ -1,0 +1,16 @@
+[project]
+name = "youtube-gemini-channel-summarizer"
+version = "0.1.0"
+description = "Windows local queue with an existing Codex browser automation worker"
+requires-python = ">=3.11"
+dependencies = ["yt-dlp>=2026.3.17"]
+
+[project.scripts]
+ytg = "ytg:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ytg"]
