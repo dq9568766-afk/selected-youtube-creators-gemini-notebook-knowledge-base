@@ -121,7 +121,7 @@ class QueueTests(unittest.TestCase):
         for _ in range(20):
             v=self.s.reserve(run)
             self.s.transition(run,v['channel_id'],v['id'],'arm')
-            self.s.transition(run,v['channel_id'],v['id'],'defer','source_unavailable')
+            self.s.transition(run,v['channel_id'],v['id'],'defer','metadata_unavailable')
         self.assertEqual(self.s.reserve(run)['stop'],'round_cap')
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],20)
 
@@ -204,5 +204,15 @@ class QueueTests(unittest.TestCase):
         for url in ['http://www.youtube.com/@test','https://evil.test/@test','https://www.youtube.com/watch?v=abcdefghijk']:
             with self.assertRaises(ytg.Stop): ytg.channel_url(url)
         with self.assertRaises(ytg.Stop): ytg.gemini_url(CHAT+'?token=no','chat')
+
+    def test_three_source_failures_pause_the_whole_queue(self):
+        run=self.s.begin('history')['id']
+        for i in range(3):
+            self.video(f'{i:011d}')
+            v=self.s.reserve(run)
+            self.s.transition(run,CID,v['id'],'arm')
+            self.s.transition(run,CID,v['id'],'defer','source_unavailable')
+        self.assertEqual(self.s.setting('pause'),'source_unavailable')
+        with self.assertRaises(ytg.Stop): self.s.reserve(run)
 
 if __name__=='__main__': unittest.main()

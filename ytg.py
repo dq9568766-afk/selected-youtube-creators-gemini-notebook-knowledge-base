@@ -238,6 +238,7 @@ class Store:
                     raise Stop('Require a completed, content-backed response in the linked chat')
                 title_for(v,value)
                 self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(value,*args))
+                self.set('source_failures',0)
             elif action=='renamed':
                 if v['state']!='summarized' or value!=title_for(v):
                     raise Stop('Exact title mismatch or summary not completed')
@@ -255,6 +256,11 @@ class Store:
                 if value not in {'source_unavailable','metadata_unavailable','live_not_ready'}:
                     raise Stop('Unknown deferral reason')
                 self.db.execute("UPDATE videos SET state='deferred',reason=?,owner=NULL WHERE channel_id=? AND id=?",(value,*args))
+                if value=='source_unavailable':
+                    failures=int(self.setting('source_failures','0'))+1
+                    self.set('source_failures',failures)
+                    if failures>=3:
+                        self.set('pause','source_unavailable')
             else:
                 raise Stop('Unknown transition')
             return self.payload(self.video(cid,vid))
