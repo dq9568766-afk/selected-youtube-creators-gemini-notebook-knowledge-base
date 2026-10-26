@@ -8,6 +8,7 @@ import argparse
 import contextlib
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -52,6 +53,14 @@ class Stop(Exception):
 def now():
     # Deliberately use the Windows local wall clock, not a fixed UTC offset.
     return datetime.now().astimezone()
+
+def default_db_path():
+    """Keep private task state outside repositories and synced folders."""
+    if os.name == 'nt':
+        base = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
+    else:
+        base = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
+    return base / 'youtube-gemini-channel-summarizer' / 'tasks.sqlite3'
 
 def channel_url(value):
     p = urlsplit(value)
@@ -375,7 +384,7 @@ def metadata(s,run,cid,vid,fetch=extract):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--db',default=str(Path(__file__).parent/'runtime'/'tasks.sqlite3'))
+    p.add_argument('--db',default=str(default_db_path()))
     sub = p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('status')
     a = sub.add_parser('add'); a.add_argument('url')

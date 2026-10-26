@@ -2,7 +2,7 @@
 
 这是供现有 Codex 自动化执行的完整运行规程。Python 管元数据和状态，Codex 管真实网页。
 不是启动 Python 就能独立控制浏览器的无人值守服务；运行需要 Codex、Chrome、现有浏览器插件以及 Gemini 登录。
-仅在该 checkout 目录执行下列 CLI；命令返回 JSON。将 run/channel/video 替换为返回值。
+仅在该 checkout 目录执行下列 CLI；命令返回 JSON。默认数据库位于本机 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`，不在同步目录中。将 run/channel/video 替换为返回值。
 永远先查看当前页面；本文控件名称是2026-10-26实测参考，网页改变时以当时真实可见控件为准。
 
 ## 一轮入口

@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+import os
 import unittest
 from unittest.mock import patch
 
@@ -191,6 +192,14 @@ class QueueTests(unittest.TestCase):
         for table in ['channels','videos','runs','settings','scans','lease']:
             names.extend(r['name'] for r in self.s.db.execute('PRAGMA table_info('+table+')'))
         self.assertFalse(set(names)&{'summary','transcript','cookie','token','browser_data'})
+
+    def test_default_state_path_is_outside_the_repository(self):
+        path = ytg.default_db_path()
+        self.assertEqual(path.name, 'tasks.sqlite3')
+        self.assertEqual(path.parent.name, 'youtube-gemini-channel-summarizer')
+        self.assertNotEqual(path.parent, Path(ytg.__file__).resolve().parent)
+        if os.name == 'nt':
+            self.assertTrue(str(path).lower().startswith(str(Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')).lower()))
 
     def test_no_cross_channel_chat_url_reuse(self):
         run=self.claimed(); self.s.transition(run,CID,VID,'arm')

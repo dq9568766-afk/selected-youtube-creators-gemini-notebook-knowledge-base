@@ -2,7 +2,7 @@
 
 中文简洁交流，实测与未测试分开。先读 README 和 docs/WORKER.md。
 
-- 工作目录是本文件所在目录；不要在其他 checkout 创建另一份 runtime 数据库。
+- 工作目录是本文件所在目录；唯一任务数据库在本机 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`。不要在同步目录或其他 checkout 创建另一份数据库。
 - 浏览器操作只使用当前已安装、已授权的 Browser Automation / Computer Use。
 - 不使用 Gemini API、私有 RPC、远程调试端口、新扩展或新浏览器配置文件。
 - yt-dlp 仅提取公开元数据。禁止下载视频、音频、字幕；禁止读取或导出 Cookie、Token、浏览器配置文件。
