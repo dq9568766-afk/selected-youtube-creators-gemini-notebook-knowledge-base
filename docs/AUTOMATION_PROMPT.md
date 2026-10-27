@@ -9,7 +9,7 @@
 ## 每日05:00增量（Asia/Shanghai）
 
 ```text
-在项目目录 H:\BaiduSyncdisk\个人基础数据\obsidian代权的知识库\NOTE\04-Creator\AI\AI产品\youtobe视频批量总结保存（gemini）\项目根目录（包含 AGENTS.md、ytg.py 和 docs/WORKER.md 的目录），先运行 python ytg.py status；可推进时按 AGENTS.md 和 docs/WORKER.md 执行每日增量检查与归档，使用 incremental --scheduled。
+在项目目录 H:\BaiduSyncdisk\个人基础数据\obsidian代权的知识库\NOTE\04-Creator\AI\AI产品\youtobe视频批量总结保存（gemini）\youtube-gemini-channel-summarizer，先运行 python ytg.py status；可推进时按 AGENTS.md 和 docs/WORKER.md 执行每日增量检查与归档，使用 incremental --scheduled。
 ```
 
 ## 发送给 Gemini 的内容
