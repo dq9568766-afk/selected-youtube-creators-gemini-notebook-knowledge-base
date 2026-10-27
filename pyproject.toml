@@ -1,5 +1,5 @@
 [project]
-name = "youtube-gemini-channel-summarizer"
+name = "youtube-creator-gemini-notebook-knowledge-base"
 version = "0.1.0"
 description = "Windows local queue with an existing Codex browser automation worker"
 requires-python = ">=3.11"
