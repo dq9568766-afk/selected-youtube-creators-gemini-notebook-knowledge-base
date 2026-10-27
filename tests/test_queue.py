@@ -1,6 +1,7 @@
 import tempfile
 from pathlib import Path
 import os
+import time
 import unittest
 from unittest.mock import patch
 
@@ -28,9 +29,10 @@ class QueueTests(unittest.TestCase):
 
     def video(self,vid=VID,cid=CID,history=True):
         self.s.insert(cid,{'id':vid,'title':'原标题：保留标点','upload_date':'20261026'},'scan',history)
+        self.s.db.execute('UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=?',(time.time(),cid,vid))
 
     def claimed(self,mode='history'):
-        self.video()
+        self.video(history=mode=='history')
         run=self.s.begin(mode)['id']
         self.s.reserve(run)
         return run
@@ -51,10 +53,10 @@ class QueueTests(unittest.TestCase):
         for d in ['00000000','20260230','2026-10-26',None]:
             with self.assertRaises(ytg.Stop): ytg.date_value(d)
 
-    def test_new_video_before_history(self):
+    def test_history_does_not_consume_incremental_videos(self):
         self.video('aaaaaaaaaaa'); self.video(VID,history=False)
         run=self.s.begin('history')['id']
-        self.assertEqual(self.s.reserve(run)['id'],VID)
+        self.assertEqual(self.s.reserve(run)['id'],'aaaaaaaaaaa')
 
     def test_channel_round_robin(self):
         self.channel(CID2)
@@ -87,24 +89,104 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop): self.s.reserve(run)
         self.assertEqual(self.s.setting('pause'),'unknown_submit')
 
-    def test_attach_requires_exact_marker_evidence(self):
+    def test_attach_requires_video_evidence(self):
         run=self.claimed(); self.s.transition(run,CID,VID,'arm')
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'attach',CHAT)
-        self.s.transition(run,CID,VID,'attach',CHAT,'marker-and-video-match')
-        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'attach',CHAT.replace('aaaa','bbbb'),'marker-and-video-match')
+        self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
+        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'attach',CHAT.replace('aaaa','bbbb'),'video-match')
 
     def test_completed_flow_and_verification_gate(self):
         run=self.claimed()
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete')
         self.s.transition(run,CID,VID,'arm')
-        self.s.transition(run,CID,VID,'attach',CHAT,'marker-and-video-match')
+        self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
         self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete')
         title=ytg.title_for(self.s.video(CID,VID))
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'renamed','wrong')
         self.s.transition(run,CID,VID,'renamed',title)
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'verify',title)
-        self.s.transition(run,CID,VID,'verify',title,'reload-notebook-reopen-marker-summary')
+        self.s.transition(run,CID,VID,'verify',title,'reload-notebook-reopen-video-summary')
         self.assertEqual(self.s.reserve(run),{'stop':'empty'})
+
+    def test_skip_records_manual_review_and_advances_without_retry(self):
+        run=self.claimed()
+        self.s.transition(run,CID,VID,'arm')
+        self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
+        skipped=self.s.transition(run,CID,VID,'skip','content_mismatch')
+        self.assertEqual(skipped['state'],'deferred')
+        self.assertEqual(skipped['chat'],CHAT)
+        self.assertEqual(skipped['reason'],'review:content_mismatch')
+        self.assertEqual(self.s.setting('pause'),'')
+        self.assertEqual(self.s.reserve(run),{'stop':'empty'})
+        report=self.s.report('history')
+        self.assertTrue(report['complete'])
+        self.assertEqual(len(report['manual_review']),1)
+        self.assertEqual(report['manual_review'][0]['id'],VID)
+
+    def test_report_waits_until_all_non_skipped_history_is_finished(self):
+        self.video()
+        run=self.s.begin('history')['id']
+        self.assertFalse(self.s.report()['complete'])
+        self.s.reserve(run)
+        self.s.transition(run,CID,VID,'skip','video_unreadable')
+        self.assertTrue(self.s.report()['complete'])
+
+    def test_history_generates_over_twenty_before_finalizing(self):
+        for i in range(22):
+            self.video(f'{i:011d}')
+        run=self.s.begin('history')['id']
+        chats=[]
+        for i in range(22):
+            item=self.s.reserve(run)
+            self.assertEqual(item['state'],'reserved')
+            self.assertEqual(item['phase'],'generate')
+            vid=item['id']
+            chat='https://gemini.google.com/app/'+f'{i:016x}'
+            self.s.transition(run,CID,vid,'arm')
+            self.s.transition(run,CID,vid,'attach',chat,'video-match')
+            self.s.transition(run,CID,vid,'summary','主题','youtube-content-complete')
+            chats.append(chat)
+        self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],22)
+        with self.assertRaises(ytg.Stop): self.s.end(run)
+        for _ in range(22):
+            item=self.s.reserve(run)
+            self.assertEqual(item['phase'],'finalize')
+            self.assertIn(item['chat'],chats)
+            self.s.transition(run,CID,item['id'],'renamed',item['expected_title'])
+            self.s.transition(run,CID,item['id'],'verify',item['expected_title'],'reopen-video-summary')
+        self.assertEqual(self.s.reserve(run),{'stop':'empty'})
+        self.s.end(run)
+
+    def test_history_resume_skips_saved_summary_until_generation_done(self):
+        run=self.claimed()
+        self.s.transition(run,CID,VID,'arm')
+        self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.video('aaaaaaaaaaa')
+        self.expire()
+        new=self.s.begin('history')['id']
+        self.assertEqual(self.s.reserve(new)['id'],'aaaaaaaaaaa')
+        self.s.transition(new,CID,'aaaaaaaaaaa','arm')
+        self.expire()
+        recovery=self.s.begin('history')['id']
+        self.assertEqual(self.s.reserve(recovery)['state'],'uncertain')
+
+    def test_incremental_leaves_history_backlog_untouched(self):
+        self.video()
+        self.video('aaaaaaaaaaa',history=False)
+        run=self.s.begin('incremental')['id']
+        self.assertEqual(self.s.reserve(run)['id'],'aaaaaaaaaaa')
+        self.s.transition(run,CID,'aaaaaaaaaaa','defer','metadata_unavailable')
+        self.assertEqual(self.s.reserve(run),{'stop':'empty'})
+        self.assertEqual(self.s.video(CID,VID)['state'],'pending')
+
+    def test_daily_schedule_accepts_each_weekday_at_five(self):
+        from datetime import datetime, timedelta
+        for offset in range(7):
+            with patch('ytg.now',return_value=datetime(2026,10,26,5,0)+timedelta(days=offset)):
+                run=self.s.begin('incremental',scheduled=True)['id']
+                self.s.end(run)
+                with self.assertRaises(ytg.Stop): self.s.begin('incremental',scheduled=True)
 
     def test_only_one_worker(self):
         self.s.begin('history')
@@ -117,7 +199,7 @@ class QueueTests(unittest.TestCase):
 
     def test_incremental_cap_is_global_even_after_recovery(self):
         self.channel(CID2)
-        for i in range(21): self.video(f'{i:011d}',CID if i%2 else CID2)
+        for i in range(21): self.video(f'{i:011d}',CID if i%2 else CID2,history=False)
         run=self.s.begin('incremental')['id']
         for _ in range(20):
             v=self.s.reserve(run)
@@ -159,9 +241,9 @@ class QueueTests(unittest.TestCase):
     def test_metadata_checks_identity_and_live_status(self):
         run=self.claimed()
         def wrong(url,flat): return {'id':VID,'channel_id':CID2,'title':'wrong','upload_date':'20261026'}
-        with self.assertRaises(ytg.Stop): ytg.metadata(self.s,run,CID,VID,wrong)
+        with self.assertRaises(ytg.Stop): ytg.metadata(self.s,run,CID,VID,wrong,force=True)
         def live(url,flat): return {'id':VID,'channel_id':CID,'title':'live','upload_date':'20261026','live_status':'is_live'}
-        self.assertEqual(ytg.metadata(self.s,run,CID,VID,live)['state'],'deferred')
+        self.assertEqual(ytg.metadata(self.s,run,CID,VID,live,force=True)['state'],'deferred')
         self.video()
         self.assertEqual(self.s.video(CID,VID)['state'],'pending')
 
@@ -181,9 +263,9 @@ class QueueTests(unittest.TestCase):
             self.s.end(second['id'])
             with self.assertRaises(ytg.Stop): self.s.begin('incremental',scheduled=True)
 
-    def test_scheduled_clock_uses_local_monday_thursday(self):
+    def test_scheduled_clock_uses_daily_local_five(self):
         from datetime import datetime
-        for t in [datetime(2026,10,26,8,29),datetime(2026,10,27,9,0)]:
+        for t in [datetime(2026,10,26,4,59),datetime(2026,10,27,4,59)]:
             with patch('ytg.now',return_value=t):
                 with self.assertRaises(ytg.Stop): self.s.begin('incremental',scheduled=True)
 
