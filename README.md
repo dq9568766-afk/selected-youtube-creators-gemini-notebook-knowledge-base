@@ -1,8 +1,8 @@
-# 把 YouTube 频道，整理成会持续更新的 Gemini 知识库 📚
+# 指定博主 YouTube 视频批量总结｜Gemini 笔记本知识库
 
-**YouTube Channel → Gemini Notebook** · [中文](#中文) · [English](#english)
+**YouTube Channel → Gemini Notebooks（笔记本）** · [中文](#中文) · [English](#english)
 
-> 关注的博主更新太快，收藏的视频越来越多？给它一个频道链接：先整理公开历史视频，再定期发现新内容。每条视频在 Gemini 留下一篇独立总结，按频道归进笔记本，想找时能重新找到。
+> 关注的博主更新太快，收藏的视频越来越多？给它一个频道链接：先整理公开历史视频，再定期发现新内容。每条视频在 Gemini 网页版 Notebooks（笔记本）功能中留下一个独立总结聊天，并按频道归档。这里的笔记本指 Gemini 网页功能，不是 Obsidian 笔记。
 
 `指定频道 → 全量采集 → 分批总结 → 自动命名 → 笔记本归档 → 定期追更`
 
@@ -20,6 +20,8 @@
 
 适合想持续跟进创作者、把视频内容按频道归档的人。摘要留在 **Gemini 网页笔记本**，这里的“知识库”指可重新打开的笔记本聊天；项目不会替你导出 Obsidian 文件或保证模型总结绝对准确。
 
+**最适配 Codex 智能体。** Codex 使用内置浏览器和已有登录会话操作 Gemini 网页；项目适合交给 Codex 按队列持续执行、断点续跑和核验。
+
 ### 怎么运行 🛠️
 
 这套工具由 **Python + yt-dlp** 采集公开元数据、管理队列，由 **Codex 内置浏览器**操作 Gemini 网页。需要 Windows、Python 3.11+、yt-dlp、正在运行的 Codex，以及具备 Notebooks 与 YouTube 内容读取能力的 Gemini 账号。电脑关机、应用退出或额度耗尽时不会继续处理。
@@ -34,7 +36,7 @@ python ytg.py scan --full
 python ytg.py status
 ```
 
-网页工作器的实际步骤、每日巡检和恢复命令见 [工作器规程](docs/WORKER.md)。`python ytg.py next` 只领取任务，不会单独向 Gemini 发送消息。本机数据库默认在 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`，不在同步仓库中。
+网页工作器的实际步骤、每日巡检和恢复命令见 [工作器规程](docs/WORKER.md)。`python ytg.py next` 只领取任务，不会单独向 Gemini 发送消息。本机数据库沿用 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3` 这一旧内部目录名，以继续使用现有任务状态；数据库不在同步仓库中。
 
 ### 更少的重复操作
 
@@ -66,7 +68,7 @@ Chats are named `YYYYMMDD-topic-full original video title` after summarization, 
 
 **The result:** a channel-by-channel, searchable collection of Gemini chats. This project does not export Obsidian notes or guarantee that model summaries are factually correct.
 
-### How it works 🛠️
+### Built for Codex agents 🛠️
 
 Python and yt-dlp collect public metadata and manage the queue. The Codex built-in browser performs the Gemini web steps using its existing signed-in session. You need Windows, Python 3.11+, yt-dlp, a running Codex app, and a Gemini account with working Notebooks and YouTube access. It does not use the Gemini API, download video, audio, or subtitles, or store summaries locally.
 
@@ -80,7 +82,7 @@ python ytg.py scan --full
 python ytg.py status
 ```
 
-See the [worker procedure](docs/WORKER.md) for web actions, scheduling, and recovery. `python ytg.py next` only reserves a task; it does not send a Gemini message by itself. Minimal SQLite task state defaults to `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`, outside the synced repository.
+See the [worker procedure](docs/WORKER.md) for web actions, scheduling, and recovery. `python ytg.py next` only reserves a task; it does not send a Gemini message by itself. Minimal SQLite task state keeps its existing `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3` storage path across the project rename, outside the synced repository.
 
 ### Safety and evidence 🔎
 
