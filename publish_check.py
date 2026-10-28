@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 ROOT=Path(__file__).resolve().parent
-TOP={'.gitignore','.githooks/pre-push','LICENSE','NOTICE.md','README.md','AGENTS.md','pyproject.toml',
+TOP={'.gitignore','.githooks/pre-push','LICENSE','NOTICE.md','README.md','AGENTS.md','SKILL.md','agents/openai.yaml','pyproject.toml',
      'ytg.py','publish_check.py'}
 PREFIX=('tests/','docs/','vendor/youtube-summarizer-chrome/','.github/workflows/')
 SENSITIVE=re.compile(r'(^|/)(runtime|work|screenshots|\.venv|__pycache__)(/|$)|cookie|token|credential|profile|storage_state|\.env|\.(db|sqlite\d*|log|jsonl)(-|$)',re.I)

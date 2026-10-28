@@ -61,6 +61,22 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.fetches,1)
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
+    def test_parallel_waits_for_attached_chats_and_never_skips_unknown_submission(self):
+        self.video()
+        self.video(OTHER)
+        run = self.s.begin('history')['id']
+        first = ytg.prepare(self.s,run,self.fetch)
+        with self.assertRaises(ytg.Stop): self.s.reserve(run,parallel=True)
+        self.s.transition(run,CID,first['id'],'arm')
+        with self.assertRaises(ytg.Stop): self.s.reserve(run,parallel=True)
+        self.s.transition(run,CID,first['id'],'attach',CHAT,'video-match')
+        second = self.s.reserve(run,parallel=True)
+        self.assertNotEqual(first['id'],second['id'])
+        ytg.metadata(self.s,run,CID,second['id'],self.fetch)
+        self.s.transition(run,CID,second['id'],'arm')
+        self.s.transition(run,CID,second['id'],'attach','https://gemini.google.com/app/bbbbbbbbbbbbbbbb','video-match')
+        self.assertEqual(self.s.reserve(run,parallel=True),{'stop':'awaiting_summaries'})
+
     def test_flat_inventory_date_does_not_allow_arm(self):
         self.video()
         run = self.s.begin('history')['id']
@@ -241,7 +257,7 @@ class EfficiencyTests(unittest.TestCase):
         row = ytg.prepare(self.s,run,self.fetch)
         ready = ytg.compact(row)
         self.assertEqual(ready['prompt'],row['prompt'])
-        self.assertEqual(ready['prompt'],'https://www.youtube.com/watch?v='+VID)
+        self.assertEqual(ready['prompt'],'https://www.youtube.com/watch?v='+VID+'\n总结')
         self.assertEqual(ready['notebook'],BOOK)
         for key in ['owner','found','seen','marker','metadata_checked']:
             self.assertNotIn(key,ready)

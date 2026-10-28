@@ -198,19 +198,26 @@ class Store:
             self.db.execute('INSERT OR REPLACE INTO lease VALUES(1,?,?)',(rid,time.time()+900))
             return dict(self.db.execute('SELECT * FROM runs WHERE id=?',(rid,)).fetchone())
 
-    def reserve(self,run):
+    def reserve(self,run,parallel=False):
         with self.tx():
             self.check_lease(run)
             r = self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
             history = int(r['mode']=='history')
+            if parallel:
+                if not history:
+                    raise Stop('Parallel reservation is only supported for history')
+                if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('reserved','uncertain') LIMIT 1").fetchone():
+                    raise Stop('Resolve the existing reservation or uncertain submission before reserving another')
             # Finish the active browser action first. Historical summaries can wait
             # for renaming while generation advances; uncertain submissions cannot.
             active = "('reserved','submitting','submitted','renamed','uncertain')" if history else "('reserved','submitting','submitted','summarized','renamed','uncertain')"
-            row = self.db.execute(f"SELECT * FROM videos WHERE owner=? AND state IN {active} ORDER BY found LIMIT 1",(run,)).fetchone()
-            if row:
-                return self.payload(row)
-            recover = "('submitting','submitted','renamed','uncertain')" if history else "('submitting','submitted','summarized','renamed','uncertain')"
-            row = self.db.execute(f"SELECT * FROM videos WHERE history=? AND state IN {recover} ORDER BY found LIMIT 1",(history,)).fetchone()
+            row = None
+            if not parallel:
+                row = self.db.execute(f"SELECT * FROM videos WHERE owner=? AND state IN {active} ORDER BY found LIMIT 1",(run,)).fetchone()
+                if row:
+                    return self.payload(row)
+                recover = "('submitting','submitted','renamed','uncertain')" if history else "('submitting','submitted','summarized','renamed','uncertain')"
+                row = self.db.execute(f"SELECT * FROM videos WHERE history=? AND state IN {recover} ORDER BY found LIMIT 1",(history,)).fetchone()
             if not row:
                 if not history and r['armed']>=20:
                     return {'stop':'round_cap','armed':r['armed']}
@@ -219,6 +226,8 @@ class Store:
                   ORDER BY c.turn ASC,COALESCE(v.published,'') DESC,v.found ASC LIMIT 1''',(history,)).fetchone()
                 if row:
                     self.db.execute("UPDATE videos SET state='reserved',owner=? WHERE channel_id=? AND id=?",(run,row['channel_id'],row['id']))
+                elif history and parallel and self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state='submitted' LIMIT 1").fetchone():
+                    return {'stop':'awaiting_summaries'}
                 elif history:
                     row = self.db.execute("SELECT * FROM videos WHERE history=1 AND state='summarized' ORDER BY found LIMIT 1").fetchone()
                 if not row:
@@ -236,7 +245,7 @@ class Store:
         if row['topic'] and row['published']:
             d['expected_title'] = title_for(row)
         if row['state']=='reserved':
-            d['prompt'] = d['url']
+            d['prompt'] = d['url'] + '\n总结'
         return d
 
     def daily_due(self):
@@ -266,7 +275,16 @@ class Store:
             self.check_lease(run)
             v = self.video(cid,vid)
             if v['owner'] != run:
-                raise Stop('Item is not owned by this run')
+                reclaimable = (
+                    action=='skip' and v['state']=='uncertain' and not v['chat'] and evidence=='search-no-result'
+                ) or (
+                    action=='attach' and v['state']=='uncertain' and not v['chat'] and
+                    evidence in {'video-match', 'marker-and-video-match'}
+                )
+                if not reclaimable:
+                    raise Stop('Item is not owned by this run')
+                self.db.execute("UPDATE videos SET owner=? WHERE channel_id=? AND id=?",(run,cid,vid))
+                v = self.video(cid,vid)
             args = (cid,vid)
             if action=='arm':
                 if v['state']!='reserved' or not v['published'] or not metadata_fresh(v):
@@ -318,8 +336,10 @@ class Store:
             elif action=='skip':
                 if value not in {'content_mismatch','video_unreadable','summary_failed','other'}:
                     raise Stop('Choose a supported manual-review reason')
-                if v['state'] not in {'reserved','submitting','submitted','uncertain'}:
-                    raise Stop('Only an unfinished item can be skipped for manual review')
+known_failure = v['state']=='submitting' and evidence in {'gemini-refusal','known-video-error'}
+                confirmed_unsaved = v['state']=='uncertain' and not v['chat'] and evidence=='search-no-result'
+                if (v['state'] not in {'reserved','submitted','uncertain'} and not known_failure) or (v['state']=='submitted' and not v['chat']) or (v['state']=='uncertain' and not v['chat'] and not confirmed_unsaved):
+                    raise Stop('Skip requires a known per-video failure; reconcile unknown submissions first')
                 self.db.execute("UPDATE videos SET state='deferred',reason=?,owner=NULL WHERE channel_id=? AND id=?",
                                 ('review:'+value,*args))
             else:
@@ -546,10 +566,11 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('status')
     a = sub.add_parser('add'); a.add_argument('url')
-    a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url')
+    a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
     a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true')
-    for name in ('next','prepare','park','end','renew'):
+    a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
+    for name in ('prepare','park','end','renew'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
     a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','attach','summary','renamed','verify','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
@@ -569,14 +590,15 @@ def main(argv=None):
             gemini_url(args.url,'notebook')
             with s.tx():
                 c = s.channel(args.channel)
-                if c['notebook'] and c['notebook']!=args.url: raise Stop('Existing notebook mapping cannot be overwritten')
+                if c['notebook'] and c['notebook']!=args.url and not args.replace_missing:
+                    raise Stop('Existing notebook mapping cannot be overwritten; verify it is missing in Gemini, then use --replace-missing')
                 s.db.execute('UPDATE channels SET notebook=? WHERE id=?',(args.url,args.channel))
             result=dict(s.channel(args.channel))
         elif args.cmd=='scan':
             ids = [args.channel] if args.channel else [x[0] for x in s.db.execute('SELECT id FROM channels')]
             result=[scan(s,c,args.full or now().weekday()==0,run=args.run) for c in ids]
         elif args.cmd=='begin': result=s.begin(args.mode,args.scheduled)
-        elif args.cmd=='next': result=s.reserve(args.run)
+        elif args.cmd=='next': result=s.reserve(args.run,args.parallel)
         elif args.cmd=='prepare': result=prepare(s,args.run)
         elif args.cmd=='park': s.park(args.run); result={'parked':True}
         elif args.cmd=='end': s.end(args.run); result={'ended':True}

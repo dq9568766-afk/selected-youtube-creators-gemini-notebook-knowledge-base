@@ -26,12 +26,12 @@
 
 这套工具由 **Python + yt-dlp** 采集公开元数据、管理队列，由 **Codex 内置浏览器**操作 Gemini 网页。需要 Windows、Python 3.11+、yt-dlp、正在运行的 Codex，以及具备 Notebooks 与 YouTube 内容读取能力的 Gemini 账号。电脑关机、应用退出或额度耗尽时不会继续处理。
 
-从仓库根目录开始。先在 Gemini 网页实际创建频道笔记本，再登记真实地址；已有本机任务库时直接查看状态，不要重复初始化。
+从仓库根目录开始。优先打开已登记的频道笔记本；如果它在 Gemini 中不存在，再在现有 Gemini 会话新建原生笔记本并登记真实地址。已有本机任务库时直接查看状态，不要重复初始化。
 
 ```powershell
 python -m unittest discover -s tests -v
 python ytg.py add https://www.youtube.com/@channel
-python ytg.py notebook CHANNEL_ID https://gemini.google.com/notebook/NOTEBOOK_ID
+python ytg.py notebook CHANNEL_ID https://gemini.google.com/notebook/NOTEBOOK_ID --replace-missing
 python ytg.py scan --full
 python ytg.py status
 ```
@@ -41,6 +41,8 @@ python ytg.py status
 ### 更少的重复操作
 
 工作器使用 `prepare RUN` 合并领取任务和元数据检查，用 `step ... summary --next` / `verify --next` 完成当前项并准备下一项。状态更新默认只返回确认信息，排错时才用 `--verbose`。普通状态命令已自动续租，不逐条额外 renew。
+
+历史总结复用同一个 Gemini 标签：每次发送视频链接和“总结”并登记独立会话后，继续提交下一条，不等待前一条生成完成；之后逐一重开核验。
 
 日常扫描各类最新50条，有10条已知重叠时停止，无重叠则全量回退；周一仍全量核对。窗口外延迟公开的视频可能到周一才被发现。历史工作器在安全边界让出队列补做当天增量，再继续历史任务。
 
@@ -91,3 +93,4 @@ The worker records state before sending. Confirmed per-video failures are skippe
 **Three videos have passed live Gemini end-to-end checks**, and **52 automated tests pass**. Sustained historical processing, future scheduled triggers, and production use across multiple channels still need observation. See the [validation record](docs/VALIDATION.md).
 
 This project builds on [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome). The [upstream source and MIT license](vendor/youtube-summarizer-chrome/) are retained, with [attribution](NOTICE.md). The production queue uses Codex web automation rather than installing the original extension. Never commit task databases, summaries, logs, screenshots, cookies, tokens, browser data, or private Notebook URLs. Run `python publish_check.py` before publishing.
+

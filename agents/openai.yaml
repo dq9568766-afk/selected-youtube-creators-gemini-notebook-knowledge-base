@@ -1,0 +1,4 @@
+interface:
+  display_name: "指定博主 YouTube 视频批量总结｜Gemini 笔记本知识库"
+  short_description: "指定频道视频总结并保存到 Gemini 网页笔记本"
+  default_prompt: "Use $youtube-creator-gemini-notebook-knowledge-base to manage a selected creator's YouTube summaries in Gemini Notebooks."
