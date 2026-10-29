@@ -36,6 +36,8 @@ class EfficiencyTests(unittest.TestCase):
 
     def video(self,vid=VID,history=True):
         self.s.insert(CID,{'id':vid,'title':'测试原标题','upload_date':'20261026'},'scan',history)
+        # These lookup tests deliberately start without a fresh scan cache.
+        self.s.db.execute('UPDATE videos SET metadata_checked=NULL WHERE id=?',(vid,))
 
     def fetch(self,url,flat):
         self.fetches += 1
@@ -84,14 +86,13 @@ class EfficiencyTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'arm')
         self.assertEqual(self.s.video(CID,VID)['state'],'reserved')
 
-    def test_expired_metadata_requires_refresh(self):
+    def test_complete_history_metadata_survives_ttl(self):
         self.video()
         run = self.s.begin('history')['id']
         ytg.prepare(self.s,run,self.fetch)
         self.s.db.execute('UPDATE videos SET metadata_checked=?',(time.time()-ytg.METADATA_TTL-1,))
-        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'arm')
         ytg.prepare(self.s,run,self.fetch)
-        self.assertEqual(self.fetches,2)
+        self.assertEqual(self.fetches,1)
         self.s.transition(run,CID,VID,'arm')
 
     def test_live_deferral_clears_previous_metadata_cache(self):
@@ -133,6 +134,77 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(result['next']['id'],OTHER)
         self.assertIn('prompt',result['next'])
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
+
+    def test_break_finalization_keeps_prepared_generation_and_orders_backlog(self):
+        run = self.submitted()
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.video(OTHER)
+        next_item = ytg.prepare(self.s,run,self.fetch)
+        self.assertEqual(next_item['id'],OTHER)
+        item = self.s.finalize(run)
+        self.assertEqual(item['id'],VID)
+        self.assertEqual(item['phase'],'finalize')
+        self.assertEqual(self.s.finalize(run)['id'],VID)
+        self.assertEqual(self.s.video(CID,OTHER)['state'],'reserved')
+        title = item['expected_title']
+        self.s.transition(run,CID,VID,'renamed',title)
+        self.s.transition(run,CID,VID,'verify',title,'reopen-video-summary')
+        self.assertEqual(self.s.finalize(run),{'stop':'no_finalize'})
+        self.assertEqual(ytg.prepare(self.s,run,self.fetch)['id'],OTHER)
+        self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
+
+    def test_break_finalization_never_bypasses_active_or_unknown_submission(self):
+        run = self.submitted()
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+        self.s.transition(run,CID,VID,'uncertain')
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+        self.assertEqual(self.s.pause_for(CID),'unknown_submit')
+        # Even without a global pause, an unresolved item cannot be bypassed.
+        self.s.set('pause','')
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+        self.s.db.execute("UPDATE videos SET state='submitting' WHERE id=?",(VID,))
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+
+    def test_break_finalization_respects_scope_and_existing_backlog(self):
+        run = self.submitted()
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.s.db.execute('UPDATE videos SET owner=NULL')
+        other_cid = 'UCYO_jab_esuFRV4b17AJtAw'
+        self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
+                          (other_cid,'https://www.youtube.com/channel/'+other_cid,'另一个频道',BOOK.replace('1','2')))
+        self.s.insert(other_cid,{'id':OTHER,'title':'其他原标题','upload_date':'20261026'},'scan',True)
+        self.s.db.execute("UPDATE videos SET state='uncertain' WHERE channel_id=?",(other_cid,))
+        self.s.db.execute('UPDATE runs SET channel_id=? WHERE id=?',(CID,run))
+        self.assertEqual(self.s.finalize(run)['id'],VID)
+        self.assertIsNone(self.s.video(other_cid,OTHER)['owner'])
+
+    def test_break_finalization_orders_oldest_and_finishes_renamed_first(self):
+        run = self.submitted()
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.video(OTHER)
+        self.s.db.execute("UPDATE videos SET state='summarized',topic='主题',chat=?,found=0 WHERE id=?",(CHAT.replace('aaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbb'),OTHER))
+        self.assertEqual(self.s.finalize(run)['id'],OTHER)
+        title = ytg.title_for(self.s.video(CID,VID))
+        self.s.transition(run,CID,VID,'renamed',title)
+        self.assertEqual(self.s.finalize(run)['id'],VID)
+
+    def test_break_finalization_requires_live_history_lease(self):
+        run = self.submitted()
+        self.s.db.execute('UPDATE lease SET expires=0')
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+        self.s.db.execute('UPDATE lease SET expires=?',(time.time()+900,))
+        self.s.db.execute("UPDATE runs SET mode='incremental' WHERE id=?",(run,))
+        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+
+    def test_break_finalization_cli_never_claims_pending_video(self):
+        self.video()
+        run = self.s.begin('history',channel_id=CID)['id']
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = ytg.main(['--db',str(self.path),'finalize',run])
+        self.assertEqual(result,0)
+        self.assertEqual(json.loads(output.getvalue()),{'stop':'no_finalize'})
+        self.assertEqual(self.s.video(CID,VID)['state'],'pending')
 
     def test_advance_refuses_arm_before_any_mutation(self):
         self.video()
