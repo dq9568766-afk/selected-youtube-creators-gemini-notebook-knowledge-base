@@ -1,158 +1,157 @@
-# YouTube 创作者视频总结 AI Skill｜Gemini 笔记本与 NotebookLM 笔记
+# 收藏的视频，终于能整理起来了 📚
 
-**一个可安装到 AI 智能体中的 Skill：采集指定 YouTube 频道，逐条总结、命名并归档到 Gemini。**
+### YouTube 创作者视频批量总结 · Gemini 笔记本知识库 · AI Skill
 
-[中文](#中文) · [English](#english) · [版本发布](https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowledge-base/releases)
+**给一个频道链接，让 AI 帮你逐条总结、命名、归档。**
 
-`指定频道 → 公开元数据采集 → Gemini 逐条总结 → 改名核验 → 笔记本归档`
+[中文](#中文) · [English](#english) · [下载版本](https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowledge-base/releases)
 
 ## 中文
 
-### 这是什么
+### 视频越收藏越多，真正回看的有几个？
 
-这是一个 **AI Skill（智能体技能）**，由技能说明、Python 队列程序和工作器规程组成。安装后，由具备文件访问、终端和浏览器操作能力的 AI 智能体执行；Python 管理任务状态，智能体操作已登录的 Gemini 网页。
+想补完一个博主的旧视频，却没时间一条条看。
 
-每个频道对应一个登记的 **Gemini 笔记本（可用于后续整理 notebooklm笔记）**，每条视频对应一个独立总结聊天。标题统一为 `YYYYMMDD-主题词-完整原视频标题`，主题词从有效总结中提取。
+想留下重点，又得反复复制链接、发给 AI、改标题、存笔记。
 
-**这里要区分保存位置与后续用途：**当前程序保存并核验的是 Gemini 网页 Notebooks 中的聊天，不会自动将聊天导出或转换为 NotebookLM 来源。本文中的 notebooklm笔记指后续整理用途，不表示项目已验证 NotebookLM 中的导入、同步或来源关联；是否存在账号侧联动也不能代替逐项核验。
+这个 **AI Skill** 把这些重复操作串起来：读取频道的公开历史清单，在已登录的 Gemini 网页逐条生成总结，再按频道归档。你拿到的是一组有日期、有主题、能重新打开的总结聊天。
 
-### 可以做什么
+> **一个频道，一本笔记；一条视频，一份总结。**
 
-| 功能 | 实际行为 |
-| --- | --- |
-| 整理频道历史 | 读取公开视频、Shorts 和直播清单；按频道和视频 ID 去重，复用完整历史元数据。 |
-| 逐条总结归档 | 一个工作标签串行执行，每条生成后立即改名、核验，再进入下一条。 |
-| 中断后续跑 | SQLite 记录最小任务状态、租约和聊天关联，优先恢复已有任务，避免重复提交。 |
-| 失败后置 | 用户授权的一次性历史采集可用 collect-first：单条失败明确延期，首轮不搜索、不重发，最终列出全部延期项。默认策略仍为 strict。 |
-| 定期追更 | 提供每日 05:00 增量规程和调度护栏，周一全量核对；需要另行配置智能体调度，安装 Skill 不会自动创建定时任务。 |
-| 控制节奏 | 每20条核验成功或明确延期后休息至少120秒；计数和休息起点跨续跑保留。增量每轮最多20次提交，历史无总条数上限。 |
+`频道链接 → 历史清单 → 逐条总结 → 自动命名 → 核验归档`
 
-正常条目在当前页面核对准确标题、完整总结、原视频链接、账号与 Notebook 归属。操作报错、页面中断、标题未更新或归属不明时，先登记必须重开的标记，再在同一工作标签重新打开已有聊天核验。无法核验不能计为成功。
+### ✨ 值得装它的 5 个理由
 
-### 通过创建技能的方式安装
+- **旧视频，按清单慢慢补齐。** 覆盖公开视频、Shorts 和直播清单，按视频 ID 去重，历史处理不设总条数上限。
+- **总结完就整理好。** 每条生成后立即改名、核验，再处理下一条。标题统一为 `YYYYMMDD-主题词-完整原视频标题`，回头找内容更方便。
+- **中断了，留着进度接着做。** 记录任务状态和已有聊天，恢复时优先接续；提交不明时按规则保留现场，避免重复发送。
+- **哪条没做成，清清楚楚。** 授权失败后置后，首轮把单条异常列入待复查清单，继续后面的内容；生成数、核验数、延期项分开汇报。
+- **旧内容整理完，新内容也能跟。** 可另配每日增量任务，发现新视频；安装 Skill 本身不会自动开启定时任务。
 
-推荐让智能体根据本仓库创建或接入本地技能，保留原有脚本和规程，而不是只复制一段提示词。以 Codex 为例，可将下面的指令直接发给它：
+### 🧠 整理完，可以怎么用？
+
+回顾某个时期的内容，按日期找；回找一个话题，先看主题词和原标题。想了解某位创作者，也可以先读总结，再挑值得细看的原视频。
+
+总结保存在 **Gemini 笔记本（可作为后续整理 NotebookLM 笔记的材料）**。另行导入 NotebookLM 并核验来源后，还可用于跨视频提问、比较观点、整理学习材料。
+
+
+### 🛠️ 怎么安装？让 AI 帮你创建技能
+
+以 Codex 为例，把下面这段发给它：
 
 ```text
-使用 $skill-creator，根据下面的仓库创建或接入本地 AI Skill：
+使用 $skill-creator，根据这个仓库创建或接入本地技能：
 https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowledge-base
 
-技能名：youtube-creator-gemini-notebook-knowledge-base
-
-先获取完整仓库并阅读根目录 SKILL.md、AGENTS.md、docs/WORKER.md 和 docs/AGENT_ADAPTERS.md。
-以仓库根目录作为唯一技能源，按当前平台支持的方式建立技能入口；已有安装时复用，不覆盖用户修改。
-保留 ytg.py、publish_check.py、docs/、tests/ 和其他依赖文件，不要仅复制 SKILL.md。
-检查 Python 3.11+、yt-dlp，以及当前平台能否通过已登录会话操作 Gemini 网页。
-完成后报告技能位置、调用方式和缺少的能力。
-本次仅安装和检查，不采集频道、不提交视频、不创建定时任务；不重建或复制已有任务数据库。
+保留完整项目，以根目录 SKILL.md 为技能入口，并遵守 AGENTS.md 和 docs/WORKER.md。
+检查并协助配置 Python 3.11+、yt-dlp 和已登录的 Gemini 网页操作能力。
+已有安装和任务进度请复用，不覆盖用户修改，不复制或重建任务数据库。
+完成后告诉我如何调用。本次只安装，不开始采集，也不创建定时任务。
 ```
 
-Codex 的技能创建入口是 `$skill-creator`，参见 [OpenAI 官方技能创建说明](https://developers.openai.com/plugins/build/skills)。其他平台使用其自身的创建技能入口，保留同样的项目文件与执行边界；平台能力与安装入口可能变化，以当前文档为准。
+**准备好这些就能开始：** Windows、Python 3.11+、yt-dlp，以及能读文件、运行命令、操作 Gemini 网页的 AI 智能体。Gemini 账号需要实际可用的 Notebooks 和 YouTube 内容读取能力。
 
-仓库已经提供规范的 [SKILL.md](SKILL.md)，安装的重点是让平台正确识别并访问完整项目，无需重新编写队列逻辑。适配要求见 [智能体适配说明](docs/AGENT_ADAPTERS.md)。安装成功不代表终端、浏览器和 Gemini 登录权限已经就绪。
+仓库已带 [SKILL.md](SKILL.md)，创建技能时接入完整项目即可，不必重新写一套流程。Codex 的 `$skill-creator` 用法见 [官方说明](https://developers.openai.com/plugins/build/skills)；其他智能体的能力要求见 [适配指南](docs/AGENT_ADAPTERS.md)。
 
-### 环境与首次使用
+### ▶️ 装好后，给它一个频道
 
-当前本地部署面向 Windows，需要 Python 3.11+、yt-dlp，以及能访问本地文件、运行命令并操作已登录 Gemini 网页的智能体。Gemini 账号须实际具备 Notebooks 与 YouTube 内容读取能力；功能可用性随账号和服务变化。
-
-在包含 `ytg.py` 的仓库根目录安装 Python 依赖：
-
-```powershell
-python -m pip install -e .
-```
-
-安装完成后，向智能体明确指定频道和采集范围，例如：
+把示例地址替换成你想整理的频道，再发给智能体：
 
 ```text
 使用 $youtube-creator-gemini-notebook-knowledge-base，整理这个频道：
 https://www.youtube.com/@channel
-请一次性采集公开历史视频，允许单条异常后置，使用 collect-first。
-先检查现有任务状态、租约和登记的 Notebook，核对网页账号与笔记本归属后再开始。
-每条总结完成后立即改名核验；结束时列出真实生成数、核验数和全部延期项。
+
+采集公开历史视频，允许单条失败后置，使用 collect-first。
+先核对现有进度、账号和对应笔记本，每条总结后立即改名核验。
+结束时告诉我生成了多少、核验了多少，以及哪些还没完成。
 ```
 
-`@channel` 是占位符，请换成真实频道。已有任务数据库时先检查状态；没有数据库时，由智能体按规程登记频道。频道与 Notebook 的命令示例：
+想每天追更，再单独让智能体配置每日增量任务。具体执行和恢复规则见 [工作器规程](docs/WORKER.md)。
+
+### 📌 使用前，知道这几件事
+
+- **需要智能体持续执行。** 电脑关机、应用退出、登录失效或额度耗尽时，不能保证继续处理；暂停不代表后台还在跑。
+- **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少2分钟；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
+- **少留一份数据。** 只采集公开元数据，不下载视频、音频或字幕，不调用 Gemini API；摘要留在 Gemini，本地只记最小任务状态。
+- **总结仍需判断。** 92项隔离自动测试已通过；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
+
+<details>
+<summary>维护与进阶：依赖、测试、任务数据库</summary>
+
+在仓库根目录安装 Python 依赖、运行隔离测试和发布检查：
 
 ```powershell
-python ytg.py add https://www.youtube.com/@channel
-python ytg.py notebook CHANNEL_ID https://gemini.google.com/notebook/NOTEBOOK_ID
-python ytg.py status
-```
-
-`CHANNEL_ID` 和 `NOTEBOOK_ID` 必须替换为实际核实的值。优先使用已登记 Notebook；缺失或换账号时按规程核验，不能任意覆盖映射。详细运行步骤以 [WORKER.md](docs/WORKER.md) 为准，不应跳过状态机直接发送。
-
-### NotebookLM 笔记的后续用途
-
-按 [SKILL.md](SKILL.md) 所述，将已核验总结另行整理为 NotebookLM 来源后，可以围绕创作者的多个视频提问、比较观点和时间变化，或生成学习与简报材料。使用前须确认来源确已导入，并检查引用与原视频；这些属于后续用途，不是当前队列自动完成的功能。
-
-### 运行边界与隐私
-
-- yt-dlp 只读公开元数据，不下载视频、音频或字幕；Gemini 总结通过已登录网页生成，不调用 Gemini API。
-- 摘要留在 Gemini，不在本地保存正文、网页快照或日志。唯一任务数据库为 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`，不放进同步仓库，不复制或重建已有库。
-- 登录、验证码、配额和确认的账号或浏览器会话故障会全局暂停；其他暂停按 WORKER 的频道范围规则处理。暂停与有效租约不代表后台正在运行。
-- 历史任务由同一聊天中的连续执行推进，不使用周期 heartbeat。每日增量单独配置；电脑关机、应用退出或能力不可用时不能保证继续处理。
-- 完成以频道报告 `complete=true` 为准，明确延期不等于成功。首轮失败项须用户另行指定后才补做。
-
-### 验证与项目文件
-
-2026-10-30 发布前的 **92项隔离自动测试通过**，并通过发布检查。已有 Gemini 网页实测见验证记录；这不代表当前流程已完成大规模长期网页验证，也不保证模型摘要准确。
-
-| 文件 | 用途 |
-| --- | --- |
-| [SKILL.md](SKILL.md) | 技能入口、能力与数据边界。 |
-| [AGENTS.md](AGENTS.md) | 项目约定。 |
-| [docs/WORKER.md](docs/WORKER.md) | 队列行为的唯一详细规程。 |
-| [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md) | 不同智能体的能力与浏览器适配。 |
-| [docs/AUTOMATION_PROMPT.md](docs/AUTOMATION_PROMPT.md) | 历史执行与每日增量提示。 |
-| [docs/VALIDATION.md](docs/VALIDATION.md) | 按日期记录的测试与网页实测范围。 |
-| [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) | 历史优化记录与性能限制。 |
-
-修改后使用隔离测试，并在提交前检查实际发布路径：
-
-```powershell
+python -m pip install -e .
 python -m unittest discover -s tests -v
 python publish_check.py
 ```
 
-发布检查读取 Git 暂存区中的已跟踪文件；不要提交任务数据库、摘要、凭据、浏览器资料或私人 Notebook 地址。
+唯一任务数据库位于 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`，不要复制、重建已有库或提交到 Git。摘要、凭据、浏览器资料和私人 Notebook 地址也不要上传。
 
-### 来源与许可
+详细规则：[SKILL.md](SKILL.md) · [项目约定](AGENTS.md) · [工作器规程](docs/WORKER.md) · [调度提示](docs/AUTOMATION_PROMPT.md) · [优化记录](docs/OPTIMIZATION.md)
 
-参考 [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome) 的 YouTube 链接到 Gemini 工作流，保留[上游源码与 MIT 许可](vendor/youtube-summarizer-chrome/)及[来源说明](NOTICE.md)。实际批量队列由智能体网页操作驱动，无需安装上游扩展。
+</details>
 
 ## English
 
-### An AI Skill for creator archives
+### 📚 Saved another video. When will you actually watch it?
 
-This repository is an **AI Skill**, with instructions, Python queue code, and worker procedures. An agent collects public YouTube channel metadata and operates an existing signed-in Gemini web session. Each video receives an independent chat in its registered Gemini Notebook, then is renamed and verified before the next video.
+Catching up with a creator means more than watching. There are links to copy, summaries to request, titles to fix, and notes to organize.
 
-Gemini chats are the verified output of this workflow. **NotebookLM notes are a downstream use:** importing summaries as NotebookLM sources and verifying that association are separate tasks. The queue does not automatically export chats or verify a NotebookLM sync.
+**This AI Skill connects those steps.** Give your agent a YouTube channel URL. It inventories public videos, summarizes them through your signed-in Gemini web session, and organizes one chat per video in the channel's registered Notebook.
 
-### Install through skill creation
+> **One creator. One notebook. One summary per video.**
 
-In Codex, ask `$skill-creator` to create or connect the skill from this repository. Keep the repository root as the canonical source and retain its scripts, documentation, and tests. Reuse an existing installation and preserve user changes; copying only SKILL.md is insufficient. See [OpenAI's skill creation guide](https://developers.openai.com/plugins/build/skills) and [agent adapters](docs/AGENT_ADAPTERS.md).
+`Channel → Video inventory → Summarize → Rename → Verify & archive`
+
+### ✨ Why use it?
+
+- **Work through the archive.** Public videos, Shorts, and streams are deduplicated by video ID. Historical processing has no overall item cap.
+- **Keep notes organized as you go.** Each summary is renamed and verified before the next video. Titles follow `YYYYMMDD-topic-full original title`.
+- **Resume with your progress intact.** Saved task state and chat links help the agent recover existing work and avoid duplicate submissions.
+- **See what actually finished.** With an authorized collect-first run, individual failures are deferred for review. Generated, verified, and deferred counts stay separate.
+- **Keep up with new uploads.** Configure a separate daily incremental task when you want one. Installing the Skill does not enable scheduling automatically.
+
+Summaries stay in **Gemini Notebooks**. You can separately import verified material into NotebookLM for cross-video questions and study resources; automatic NotebookLM import or sync verification is outside this workflow.
+
+### 🛠️ Install by asking your agent to create the Skill
+
+In Codex, paste:
 
 ```text
-Use $skill-creator to create or connect the local skill
-`youtube-creator-gemini-notebook-knowledge-base` from:
+Use $skill-creator to create or connect a local skill from:
 https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowledge-base
-Read SKILL.md, AGENTS.md, docs/WORKER.md, and docs/AGENT_ADAPTERS.md.
-Keep the complete repository as the canonical source. Verify Python 3.11+,
-yt-dlp, file and shell access, and signed-in Gemini browser capabilities.
-Only install and check capabilities; do not process videos, schedule tasks,
-or recreate or copy an existing task database.
+
+Keep the full project, use its root SKILL.md as the entry point,
+and follow AGENTS.md and docs/WORKER.md.
+Help check Python 3.11+, yt-dlp, and signed-in Gemini browser access.
+Reuse existing installations and progress; preserve user changes.
+Do not recreate or copy an existing task database.
+Report how to invoke it. Install only; do not collect videos or schedule tasks.
 ```
 
-The current local deployment targets Windows. Install dependencies with `python -m pip install -e .` from the repository root, then explicitly request collection for a real channel. Skill installation alone does not configure browser access, sign-in, or daily scheduling.
+You need Windows, Python 3.11+, yt-dlp, and an agent with file, shell, and browser access. Your Gemini account must support Notebooks and YouTube content access. See the [skill creation guide](https://developers.openai.com/plugins/build/skills) and [agent adapters](docs/AGENT_ADAPTERS.md).
 
-### Workflow and limits
+### ▶️ Start with a channel you follow
 
-- Default policy is strict. Explicitly authorized one-pass historical collection may use channel-scoped collect-first, recording item failures as deferrals without first-pass retries.
-- Use one working tab and process videos serially. Verify title, full summary, original video link, account, and Notebook membership. Anomalies require reopening the saved chat before verification.
-- Rest at least 120 seconds after every 20 settled items; counts persist across restarts. Incremental rounds allow up to 20 submissions; history has no overall item cap. Daily 05:00 execution requires separately configured scheduling.
-- yt-dlp reads public metadata only. No media or subtitle downloads, Gemini API calls, or local summary storage. Keep the canonical database outside the repository.
-- Completion requires the channel report to return `complete=true`. Deferrals are reported separately from successes. Follow [WORKER.md](docs/WORKER.md) for pause, recovery, pacing, and cleanup rules.
+Replace the example URL, then ask:
 
-The release validation on 2026-10-30 passed 92 isolated tests and the publish check. See [validation records](docs/VALIDATION.md) for the actual scope of live Gemini checks and remaining limits. Long-term stability and summary accuracy are not guaranteed.
+```text
+Use $youtube-creator-gemini-notebook-knowledge-base for:
+https://www.youtube.com/@channel
 
-Based on the upstream [YouTube-to-Gemini workflow](https://github.com/soumikdr/youtube-summarizer-chrome), with [source and MIT license retained](vendor/youtube-summarizer-chrome/) and [attribution](NOTICE.md).
+Collect public historical videos using collect-first, with item failures deferred.
+Check existing progress, account, and Notebook identity before starting.
+Rename and verify each summary immediately.
+Report generated and verified counts, plus every unfinished item.
+```
+
+### 📌 Before you start
+
+The agent needs to remain available to execute the workflow. Login, quota, and session blockers can stop progress. Processing uses one working tab, with a break of at least 2 minutes after every 20 settled items.
+
+Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **92 isolated tests pass**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
+
+---
+
+参考 / Inspired by [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome)。保留 [上游源码与 MIT 许可 / upstream source and MIT license](vendor/youtube-summarizer-chrome/) · [来源说明 / Attribution](NOTICE.md)。
