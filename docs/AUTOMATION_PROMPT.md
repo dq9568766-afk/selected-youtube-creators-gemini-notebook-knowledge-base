@@ -12,7 +12,11 @@
 
 ## 每日05:00增量（Asia/Shanghai）
 
-先status；检查全局pause及pauses中本频道的暂停，任一存在或其他worker持有有效租约则直接退出；其他频道暂停不阻断本频道。使用strict的incremental --scheduled --channel CHANNEL_ID；按WORKER扫描和归档，不自动清暂停或恢复历史。历史遇到daily_due在安全边界park，增量结束后以原policy重开同频道历史。
+每天只触发一次。先status --channel CHANNEL_ID；检查全局及本频道pause，有暂停则安静退出。其他worker持有本频道有效租约时退出，由正在执行的Goal承担每日交接；其他频道暂停/租约不阻断本频道，不抢占租约。
+
+空闲时使用begin --mode incremental --scheduled --channel CHANNEL_ID --policy collect-first，scan --channel CHANNEL_ID --run RUN，扫描成功才处理新ID。20次提交预算按频道/本地自然日持久化，超额pending留次日；单条异常延期继续，账号及服务阻塞保留暂停、通知一次，不反复唤醒。独立每日轮次用end结束，不自动启动历史。
+
+正在执行历史的同一Goal遇到daily_due时，结清当前视频并handoff HISTORY_RUN，扫描并处理返回的同频道增量run。增量empty/daily_cap/round_cap后handoff DAILY_RUN，使用返回的原policy历史run立即继续，不结束Goal、不要求用户再次继续。扫描失败不能end或当作增量完成，按WORKER有限恢复/暂停。每日轮次扫描成功及预算结果与历史完成状态分别报告。
 
 ## Gemini消息
 

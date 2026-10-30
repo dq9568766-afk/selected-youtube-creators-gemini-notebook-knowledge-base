@@ -222,6 +222,7 @@ class EfficiencyTests(unittest.TestCase):
             self.s.park(run)
             daily=self.s.begin('incremental',scheduled=True)['id']
             self.assertEqual(self.s.reserve(daily),{'stop':'empty'})
+            ytg.scan(self.s,CID,fetch=lambda *a,**k: {'channel_id':CID,'entries':[]},run=daily)
             self.s.end(daily)
             resumed=self.s.begin('history')['id']
             self.assertEqual(ytg.prepare(self.s,resumed,self.fetch),{'stop':'empty'})

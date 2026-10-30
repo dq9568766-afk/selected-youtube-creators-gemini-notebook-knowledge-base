@@ -186,6 +186,7 @@ class QueueTests(unittest.TestCase):
         for offset in range(7):
             with patch('ytg.now',return_value=datetime(2026,10,26,5,0)+timedelta(days=offset)):
                 run=self.s.begin('incremental',scheduled=True)['id']
+                ytg.scan(self.s,CID,fetch=lambda *a,**k: {'channel_id':CID,'entries':[]},run=run)
                 self.s.end(run)
                 with self.assertRaises(ytg.Stop): self.s.begin('incremental',scheduled=True)
 
@@ -261,6 +262,7 @@ class QueueTests(unittest.TestCase):
             second=self.s.begin('incremental',scheduled=True)
             self.assertEqual(first['id'],second['id'])
             self.assertEqual(second['armed'],19)
+            ytg.scan(self.s,CID,fetch=lambda *a,**k: {'channel_id':CID,'entries':[]},run=second['id'])
             self.s.end(second['id'])
             with self.assertRaises(ytg.Stop): self.s.begin('incremental',scheduled=True)
 

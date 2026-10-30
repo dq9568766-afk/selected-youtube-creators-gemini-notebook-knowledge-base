@@ -21,6 +21,12 @@ import uuid
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS daily_budget(channel_id TEXT NOT NULL, day TEXT NOT NULL,
+ used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(channel_id,day));
+CREATE TABLE IF NOT EXISTS initial_inventory(channel_id TEXT NOT NULL, tab TEXT NOT NULL,
+ id TEXT NOT NULL, title TEXT NOT NULL, published TEXT, PRIMARY KEY(channel_id,tab,id));
+CREATE TABLE IF NOT EXISTS run_inventory(run_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+ checked TEXT NOT NULL, PRIMARY KEY(run_id,channel_id));
 CREATE TABLE IF NOT EXISTS pacing(scope TEXT PRIMARY KEY, processed INTEGER NOT NULL DEFAULT 0,
  break_started REAL);
 CREATE TABLE IF NOT EXISTS pauses(scope TEXT PRIMARY KEY, reason TEXT NOT NULL, updated REAL NOT NULL);
@@ -38,7 +44,7 @@ CREATE TABLE IF NOT EXISTS runs(
  armed INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0,
  batch_count INTEGER NOT NULL DEFAULT 0, batch_started REAL, phase TEXT NOT NULL DEFAULT 'generate');
 CREATE TABLE IF NOT EXISTS lease(
- singleton INTEGER PRIMARY KEY CHECK(singleton=1), run_id TEXT NOT NULL,
+ scope TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE,
  expires REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS videos(
  channel_id TEXT NOT NULL REFERENCES channels(id), id TEXT NOT NULL,
@@ -141,8 +147,14 @@ class Store:
                     self.db.execute('ALTER TABLE videos ADD COLUMN metadata_checked REAL')
         run_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
         with self.tx():
+            for name, declaration in [('scan_stamp','TEXT'), ('outcome','TEXT'), ('parent_run','TEXT')]:
+                if name not in run_columns:
+                    self.db.execute(f'ALTER TABLE runs ADD COLUMN {name} {declaration}')
             if 'channel_id' not in run_columns:
                 self.db.execute('ALTER TABLE runs ADD COLUMN channel_id TEXT')
+            if not self.setting('daily_budget_version'):
+                self.db.execute("INSERT OR IGNORE INTO daily_budget SELECT COALESCE(channel_id,'*'),substr(schedule_key,1,10),sum(armed) FROM runs WHERE schedule_key IS NOT NULL GROUP BY COALESCE(channel_id,'*'),substr(schedule_key,1,10)")
+                self.set('daily_budget_version','1')
             if 'policy' not in run_columns:
                 self.db.execute("ALTER TABLE runs ADD COLUMN policy TEXT NOT NULL DEFAULT 'strict'")
             if 'batch_count' not in run_columns:
@@ -183,6 +195,13 @@ class Store:
                     self.db.execute('INSERT OR IGNORE INTO pacing VALUES(?,?,?)',(key,count,started))
                 self.set('pacing_version','2')
         self._migrate_pause()
+        # Preserve an existing worker's ownership and expiry during the upgrade.
+        with self.tx():
+            if 'singleton' in {r['name'] for r in self.db.execute('PRAGMA table_info(lease)')}:
+                self.db.execute('ALTER TABLE lease RENAME TO lease_legacy')
+                self.db.execute('CREATE TABLE lease(scope TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, expires REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0)')
+                self.db.execute("INSERT INTO lease SELECT COALESCE(r.channel_id,'*'),l.run_id,l.expires,l.last_seen FROM lease_legacy l LEFT JOIN runs r ON r.id=l.run_id")
+                self.db.execute('DROP TABLE lease_legacy')
 
     @contextlib.contextmanager
     def tx(self):
@@ -281,21 +300,25 @@ class Store:
 
 
     def check_lease(self,run):
-        r = self.db.execute('SELECT * FROM lease WHERE singleton=1').fetchone()
+        r = self.db.execute('SELECT * FROM lease WHERE run_id=?',(run,)).fetchone()
         if not r or r['run_id'] != run or r['expires'] < time.time():
             raise Stop('Run has no live lease; reopen the same run before continuing')
         run_row=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(run,)).fetchone()
         reason=self.pause_for(run_row['channel_id'] if run_row else None)
         if reason:
             raise Stop('Paused: '+reason)
-        self.db.execute('UPDATE lease SET expires=?,last_seen=? WHERE singleton=1',(time.time()+900,time.time()))
+        self.db.execute('UPDATE lease SET expires=?,last_seen=? WHERE run_id=?',(time.time()+900,time.time(),run))
+
+    def conflicting_leases(self,channel_id):
+        return self.db.execute("SELECT * FROM lease WHERE (?='*' OR scope='*' OR scope=?)",
+                               (channel_id or '*',channel_id or '*')).fetchall()
 
     def begin(self,mode,scheduled=False,channel_id=None,policy='strict',run_id=None):
         with self.tx():
             if mode not in {'history','incremental'}:
                 raise Stop('Unknown run mode')
-            if policy not in {'strict','collect-first'} or (policy=='collect-first' and (mode!='history' or not channel_id)):
-                raise Stop('collect-first requires a channel-scoped historical run')
+            if policy not in {'strict','collect-first'} or (policy=='collect-first' and not channel_id):
+                raise Stop('collect-first requires a channel-scoped run')
             if run_id:
                 saved=self.db.execute('SELECT * FROM runs WHERE id=?',(run_id,)).fetchone()
                 if not saved or saved['finished'] or saved['mode']!=mode or saved['channel_id']!=channel_id:
@@ -312,13 +335,14 @@ class Store:
                     raise Stop('Scheduled daily rounds must use incremental mode')
                 if (t.hour,t.minute)<(5,0):
                     raise Stop('Not yet the daily local 05:00 due window')
-                key = t.date().isoformat()
-            old = self.db.execute('SELECT * FROM lease WHERE singleton=1').fetchone()
-            if old and old['expires'] > time.time():
-                raise Stop('Another worker owns the queue')
-            if old:
+                key = t.date().isoformat() + (':'+channel_id if channel_id else '')
+            old_leases = self.conflicting_leases(channel_id)
+            if any(old['expires'] > time.time() for old in old_leases):
+                raise Stop('Another worker owns the queue scope')
+            for old in old_leases:
                 self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE state='reserved' AND owner=?",(old['run_id'],))
                 self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE state='submitting' AND owner=?",(old['run_id'],))
+                self.db.execute('DELETE FROM lease WHERE run_id=?',(old['run_id'],))
             scope=' AND channel_id=?' if channel_id else ''
             self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE state IN ('submitted','summarized','renamed')"+scope,(channel_id,) if channel_id else ())
             existing = self.db.execute('SELECT * FROM runs WHERE schedule_key=?',(key,)).fetchone() if key else None
@@ -333,7 +357,7 @@ class Store:
                         self.db.execute('UPDATE runs SET failure_streak=?,health_after=?,health_probe=? WHERE id=?',tuple(previous[k] for k in ('failure_streak','health_after','health_probe'))+(rid,))
 
             self._sync_pacing(rid)
-            self.db.execute('INSERT OR REPLACE INTO lease(singleton,run_id,expires,last_seen) VALUES(1,?,?,?)',(rid,time.time()+900,time.time()))
+            self.db.execute('INSERT INTO lease(scope,run_id,expires,last_seen) VALUES(?,?,?,?)',(channel_id or '*',rid,time.time()+900,time.time()))
             return dict(self.db.execute('SELECT * FROM runs WHERE id=?',(rid,)).fetchone())
 
     def _sync_pacing(self,run):
@@ -401,6 +425,8 @@ class Store:
             return {'stop':'empty'}
         if r['mode']=='incremental' and r['armed']>=20:
             return {'stop':'round_cap','armed':r['armed']}
+        if r['mode']=='incremental' and self.budget_used(r['channel_id'])>=20:
+            return {'stop':'daily_cap','used':self.budget_used(r['channel_id'])}
         remaining=self._break_remaining(run)
         if remaining:
             return {'stop':'break_required','seconds_remaining':remaining}
@@ -426,8 +452,8 @@ class Store:
 
     def cleanup(self,run):
         with self.tx():
-            lease=self.db.execute('SELECT * FROM lease WHERE singleton=1').fetchone()
-            if lease and lease['run_id']!=run:
+            owner=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(run,)).fetchone()
+            if owner and any(l['run_id']!=run for l in self.conflicting_leases(owner['channel_id'])):
                 raise Stop('Cannot clean another worker lease')
             if not self.db.execute('SELECT 1 FROM runs WHERE id=?',(run,)).fetchone():
                 raise Stop('Unknown run')
@@ -442,7 +468,7 @@ class Store:
             if evidence!='notebook-identity-checked':
                 raise Stop('Notebook identity evidence required')
             self.channel(cid)
-            if self.db.execute('SELECT 1 FROM lease WHERE expires>?',(time.time(),)).fetchone():
+            if any(l['expires']>time.time() for l in self.conflicting_leases(cid)):
                 raise Stop('Another worker owns the queue')
             items=self.db.execute("SELECT id FROM videos WHERE channel_id=? AND history=1 AND state IN ('uncertain','submitting')",(cid,)).fetchall()
             for item in items:
@@ -464,13 +490,23 @@ class Store:
             d['prompt'] = d['url'] + '\n总结'
         return d
 
-    def daily_due(self):
+    def budget_used(self,channel_id=None):
+        if channel_id:
+            row=self.db.execute('SELECT COALESCE(sum(used),0) FROM daily_budget WHERE day=? AND channel_id IN (?,?)',(now().date().isoformat(),channel_id,'*')).fetchone()
+        else:
+            row=self.db.execute('SELECT COALESCE(sum(used),0) FROM daily_budget WHERE day=?',(now().date().isoformat(),)).fetchone()
+        return row[0]
+
+    def daily_due(self,channel_id=None):
+        if channel_id is None:
+            return any(self.daily_due(c[0]) for c in self.db.execute('SELECT id FROM channels WHERE initialized=1'))
         t = now()
         if (t.hour,t.minute)<(5,0):
             return False
-        r = self.db.execute('SELECT finished FROM runs WHERE schedule_key=?',
-                            (t.date().isoformat(),)).fetchone()
-        return not r or not r['finished']
+        day=t.date().isoformat()
+        r = self.db.execute('SELECT 1 FROM runs WHERE schedule_key IN (?,?) AND finished=1',
+                            (day+':'+channel_id,day)).fetchone()
+        return not bool(r)
 
     def park(self,run):
         """Release a historical worker at a safe boundary for the daily round."""
@@ -523,6 +559,10 @@ class Store:
                 r = self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
                 if r['mode']=='incremental' and r['armed']>=20:
                     raise Stop('20 submissions already reserved in this round')
+                if r['mode']=='incremental':
+                    if self.budget_used(cid)>=20:
+                        raise Stop('Channel daily submission budget exhausted')
+                    self.db.execute('INSERT INTO daily_budget VALUES(?,?,1) ON CONFLICT(channel_id,day) DO UPDATE SET used=used+1',(cid,now().date().isoformat()))
                 self.db.execute('UPDATE runs SET armed=armed+1 WHERE id=?',(run,))
                 self.db.execute("UPDATE videos SET state='submitting' WHERE channel_id=? AND id=?",args)
             elif action=='attach':
@@ -603,6 +643,19 @@ class Store:
     def end(self,run):
         with self.tx():
             self.check_lease(run)
+            r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
+            if r['mode']=='incremental' and r['schedule_key']:
+                if not r['scan_stamp'] or r['scan_stamp'][:10]!=now().date().isoformat():
+                    raise Stop('Complete this round inventory scan before ending')
+                channels=[r['channel_id']] if r['channel_id'] else [c[0] for c in self.db.execute('SELECT id FROM channels')]
+                for cid in channels:
+                    checked=self.db.execute('SELECT checked FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid)).fetchone()
+                    if not checked or checked[0][:10]!=now().date().isoformat():
+                        raise Stop('Complete all scoped channel inventories before ending')
+                remaining=self.db.execute("SELECT count(*) FROM videos WHERE history=0 AND state NOT IN ('verified','deferred')"+(' AND channel_id=?' if r['channel_id'] else ''),(r['channel_id'],) if r['channel_id'] else ()).fetchone()[0]
+                if remaining and self.budget_used(r['channel_id'])<20 and r['armed']<20:
+                    raise Stop('Incremental tasks remain; continue before ending')
+                self.db.execute('UPDATE runs SET outcome=? WHERE id=?',('budget_exhausted' if remaining else 'complete',run))
             unresolved = self.db.execute("SELECT count(*) FROM videos WHERE owner=? AND state IN ('submitting','submitted','summarized','renamed','uncertain')",(run,)).fetchone()[0]
             if unresolved:
                 raise Stop('Finish or pause the outstanding chat before ending the round')
@@ -610,11 +663,32 @@ class Store:
             self.db.execute('UPDATE runs SET finished=1 WHERE id=?',(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
 
-    def status(self,verbose=True):
+    def handoff(self,run):
+        r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
+        if not r or not r['channel_id']:
+            raise Stop('Handoff requires a channel-scoped run')
+        cid=r['channel_id']
+        if r['mode']=='history':
+            if not self.daily_due(cid):
+                raise Stop('Daily incremental is not due')
+            self.park(run)
+            target=self.begin('incremental',scheduled=True,channel_id=cid,policy='collect-first')
+            self.db.execute('UPDATE runs SET parent_run=? WHERE id=?',(run,target['id']))
+            return {'run':target['id'],'mode':'incremental','channel_id':cid,'next_action':'scan --channel CHANNEL --run RUN; process until empty/daily_cap; handoff RUN'}
+        if not r['parent_run']:
+            raise Stop('No historical parent to resume; end this daily round normally')
+        parent=self.db.execute('SELECT * FROM runs WHERE id=?',(r['parent_run'],)).fetchone()
+        self.end(run)
+        target=self.begin('history',channel_id=cid,policy=parent['policy'])
+        return {'run':target['id'],'mode':'history','channel_id':cid,'policy':target['policy'],'next_action':'prepare RUN; continue in the same worker'}
+
+    def status(self,verbose=True,channel_id=None):
         if not verbose:
             lease = self.db.execute('SELECT run_id,expires FROM lease WHERE expires>?',(time.time(),)).fetchone()
             return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'busy':bool(lease),
-                    'daily_due':self.daily_due(),
+                    'leases':[dict(x) for x in self.db.execute('SELECT scope,run_id,expires FROM lease WHERE expires>?',(time.time(),))],
+                    'daily_due':self.daily_due(channel_id), 'channel_id':channel_id,
+                    'daily_used':self.budget_used(channel_id),
                     'states':[dict(x) for x in self.db.execute('SELECT history,state,count(*) AS count FROM videos GROUP BY history,state')]}
         return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
                 'states':[dict(x) for x in self.db.execute('SELECT state,history,count(*) AS count FROM videos GROUP BY state,history')],
@@ -639,8 +713,6 @@ class Store:
         total=0
         for row in rows:
             counts[row['state']]=counts.get(row['state'],0)+1
-            if row['missing'] and row['state']=='pending':
-                continue
             total+=1
             generated+=int(row['state'] in {'summarized','renamed','verified'} or (row['state']=='deferred' and row['reason']=='archive_unverified' and bool(row['topic'])))
             if row['state']=='deferred':
@@ -697,16 +769,29 @@ def scan(s,cid,full=False,fetch=extract,run=None):
     if run:
         with s.tx():
             s.check_lease(run)
-            round_info = s.db.execute('SELECT schedule_key FROM runs WHERE id=?',(run,)).fetchone()
-            day = round_info['schedule_key']
-            if (day and (c['last_check'] or '')[:10]==day
-                    and (not full or (c['last_full'] or '')[:10]==day)):
+            round_info = s.db.execute('SELECT schedule_key,scan_stamp,channel_id FROM runs WHERE id=?',(run,)).fetchone()
+            if round_info['channel_id'] and round_info['channel_id']!=cid:
+                raise Stop('Scan channel is outside run scope')
+            day = (round_info['schedule_key'] or '')[:10]
+            checked=s.db.execute('SELECT checked FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid)).fetchone()
+            if (day and checked and checked[0][:10]==now().date().isoformat()
+                    and (not full or (c['last_full'] or '')[:10]==now().date().isoformat())):
                 return {'channel_id':cid,'complete':True,'skipped':'already_checked_today','tabs':[]}
+            s.db.execute('DELETE FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid))
     stamp = now().isoformat()
     complete = True
     results = []
+    initial_key='initial_staging:'+cid
+    if not c['initialized'] and not s.setting(initial_key):
+        with s.tx():
+            if run: s.check_lease(run)
+            s.set(initial_key,stamp)
     for tab in ('videos','shorts','streams'):
         try:
+            saved=s.db.execute('SELECT status,checked FROM scans WHERE channel_id=? AND tab=?',(cid,tab)).fetchone()
+            if not c['initialized'] and saved and saved['checked']>=s.setting(initial_key) and saved['status'] in {'ok','absent'}:
+                results.append({'tab':tab,'status':saved['status'],'scope':'initial_saved'})
+                continue
             windowed = bool(c['initialized'] and not full)
             url = c['url']+'/'+tab
             info = fetch(url,True,limit=SCAN_WINDOW) if windowed else fetch(url,True)
@@ -730,7 +815,12 @@ def scan(s,cid,full=False,fetch=extract,run=None):
                 for entry in entries:
                     if not entry:
                         raise Stop('Null entry makes the inventory incomplete')
-                    s.insert(cid,entry,stamp,not c['initialized'])
+                    if c['initialized']:
+                        s.insert(cid,entry,stamp,False)
+                    else:
+                        if not re.fullmatch(r'[A-Za-z0-9_-]{11}',entry.get('id') or ''):
+                            raise Stop('Invalid video id in inventory')
+                        s.db.execute('INSERT OR REPLACE INTO initial_inventory VALUES(?,?,?,?,?)',(cid,tab,entry['id'],entry.get('title') or entry['id'],entry.get('upload_date')))
                     count += 1
                 s.db.execute('INSERT OR REPLACE INTO scans VALUES(?,?,?,?,?)',(cid,tab,count,'ok',stamp))
             results.append({'tab':tab,'status':'ok','count':count,
@@ -748,11 +838,19 @@ def scan(s,cid,full=False,fetch=extract,run=None):
     with s.tx():
         if run: s.check_lease(run)
         if complete:
+            if not c['initialized']:
+                for entry in s.db.execute('SELECT id,title,published AS upload_date FROM initial_inventory WHERE channel_id=?',(cid,)).fetchall():
+                    s.insert(cid,dict(entry),stamp,True)
+                s.db.execute('DELETE FROM initial_inventory WHERE channel_id=?',(cid,))
             s.db.execute('UPDATE channels SET initialized=1,last_check=? WHERE id=?',(stamp,cid))
+            if run:
+                s.db.execute('UPDATE runs SET scan_stamp=? WHERE id=?',(stamp,run))
+                s.db.execute('INSERT OR REPLACE INTO run_inventory VALUES(?,?,?)',(run,cid,stamp))
             if full or not c['initialized']:
                 s.db.execute('UPDATE channels SET last_full=? WHERE id=?',(stamp,cid))
                 # Missing means absent from a complete public listing; never delete a task/chat.
                 s.db.execute('UPDATE videos SET missing=1 WHERE channel_id=? AND seen<>?',(cid,stamp))
+                s.db.execute("UPDATE videos SET state='deferred',reason='source_missing',deferral_policy='inventory',owner=NULL WHERE channel_id=? AND missing=1 AND state='pending'",(cid,))
     return {'channel_id':cid,'complete':complete,'tabs':results}
 
 def metadata(s,run,cid,vid,fetch=extract,force=False):
@@ -796,8 +894,8 @@ def prepare(s,run,fetch=extract):
         r = s.db.execute('SELECT mode,channel_id FROM runs WHERE id=?',(run,)).fetchone()
         scope=' AND channel_id=?' if r['channel_id'] else ''
         active = s.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone()
-        if r['mode']=='history' and not active and s.daily_due():
-            return {'stop':'daily_due','next_action':'park history, run scheduled incremental, then resume history'}
+        if r['mode']=='history' and not active and s.daily_due(r['channel_id']):
+            return {'stop':'daily_due','next_action':'handoff RUN; scan and process returned incremental run; handoff back to history in the same worker'}
     item = s.reserve(run)
     if item.get('state')=='reserved':
         try:
@@ -842,13 +940,13 @@ def main(argv=None):
     p.add_argument('--db',default=str(default_db_path()))
     p.add_argument('--verbose',action='store_true',help='Return full records for troubleshooting')
     sub = p.add_subparsers(dest='cmd',required=True)
-    sub.add_parser('status')
+    a = sub.add_parser('status'); a.add_argument('--channel')
     a = sub.add_parser('add'); a.add_argument('url')
     a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
     a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true'); a.add_argument('--channel'); a.add_argument('--policy',choices=['strict','collect-first'],default='strict'); a.add_argument('--run')
     a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
-    for name in ('prepare','park','end','renew','finalize','cleanup'):
+    for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
     a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','attach','summary','renamed','verify','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
@@ -862,7 +960,7 @@ def main(argv=None):
         if not Path(args.db).is_file() and args.cmd!='add':
             raise Stop('Task database is missing; refusing to create an empty replacement')
         s = Store(args.db)
-        if args.cmd=='status': result=s.status(verbose=args.verbose)
+        if args.cmd=='status': result=s.status(verbose=args.verbose,channel_id=args.channel)
         elif args.cmd=='report': result=s.report(args.mode,args.channel)
         elif args.cmd=='add': result=add_channel(s,args.url)
         elif args.cmd=='notebook':
@@ -885,6 +983,7 @@ def main(argv=None):
         elif args.cmd=='prepare': result=prepare(s,args.run)
         elif args.cmd=='finalize': result=s.finalize(args.run)
         elif args.cmd=='cleanup': result=s.cleanup(args.run)
+        elif args.cmd=='handoff': result=s.handoff(args.run)
         elif args.cmd=='adopt-unknown': result=s.adopt_unknown(args.channel,args.evidence)
         elif args.cmd=='park': s.park(args.run); result={'parked':True}
         elif args.cmd=='end': s.end(args.run); result={'ended':True}
@@ -906,7 +1005,10 @@ def main(argv=None):
             # Must only be called after human approval; never by a timer.
             with s.tx():
                 s.clear_pause(args.channel)
-                s.db.execute('UPDATE lease SET expires=0')
+                if args.channel:
+                    s.db.execute('UPDATE lease SET expires=0 WHERE scope IN (?,?)',(args.channel,'*'))
+                else:
+                    s.db.execute('UPDATE lease SET expires=0')
             result={'resumed':True,'channel_id':args.channel}
         if not args.verbose and isinstance(result,dict):
             result=compact(result,ack=args.cmd=='step')
