@@ -63,21 +63,13 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.fetches,1)
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
-    def test_parallel_waits_for_attached_chats_and_never_skips_unknown_submission(self):
-        self.video()
+    def test_parallel_is_rejected_even_after_chat_attachment(self):
+        run=self.submitted()
         self.video(OTHER)
-        run = self.s.begin('history')['id']
-        first = ytg.prepare(self.s,run,self.fetch)
-        with self.assertRaises(ytg.Stop): self.s.reserve(run,parallel=True)
-        self.s.transition(run,CID,first['id'],'arm')
-        with self.assertRaises(ytg.Stop): self.s.reserve(run,parallel=True)
-        self.s.transition(run,CID,first['id'],'attach',CHAT,'video-match')
-        second = self.s.reserve(run,parallel=True)
-        self.assertNotEqual(first['id'],second['id'])
-        ytg.metadata(self.s,run,CID,second['id'],self.fetch)
-        self.s.transition(run,CID,second['id'],'arm')
-        self.s.transition(run,CID,second['id'],'attach','https://gemini.google.com/app/bbbbbbbbbbbbbbbb','video-match')
-        self.assertEqual(self.s.reserve(run,parallel=True),{'stop':'awaiting_summaries'})
+        with self.assertRaises(ytg.Stop):
+            self.s.reserve(run,parallel=True)
+        self.assertEqual(self.s.reserve(run)['state'],'submitted')
+        self.assertEqual(self.s.video(CID,OTHER)['state'],'pending')
 
     def test_flat_inventory_date_does_not_allow_arm(self):
         self.video()
@@ -113,26 +105,30 @@ class EfficiencyTests(unittest.TestCase):
         self.s.insert(CID,{'id':VID,'title':'修改后的标题'},'later',True)
         self.assertIsNone(self.s.video(CID,VID)['metadata_checked'])
 
-    def test_advance_commits_previous_summary_when_next_lookup_fails(self):
-        run = self.submitted()
+    def test_advance_commits_verification_when_next_lookup_fails(self):
+        run=self.submitted()
         self.video(OTHER)
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
+        title=ytg.title_for(self.s.video(CID,VID))
+        self.s.transition(run,CID,VID,'renamed',title)
         def fail(url,flat): raise RuntimeError('private extractor failure details')
-        result = ytg.advance(self.s,run,CID,VID,'summary','主题','youtube-content-complete',fail)
-        self.assertEqual(result['completed']['state'],'summarized')
+        result=ytg.advance(self.s,run,CID,VID,'verify',title,ytg.CURRENT_PAGE_EVIDENCE,fail)
+        self.assertEqual(result['completed']['state'],'verified')
         self.assertIn('stopped',result['next'])
         self.assertNotIn('private extractor',json.dumps(result))
         self.assertEqual(self.s.video(CID,VID)['chat'],CHAT)
         self.assertEqual(self.s.video(CID,OTHER)['state'],'reserved')
-        recovered = ytg.prepare(self.s,run,self.fetch)
-        self.assertEqual(recovered['id'],OTHER)
+        self.assertEqual(ytg.prepare(self.s,run,self.fetch)['id'],OTHER)
 
-    def test_advance_prepares_next_and_keeps_only_one_submission(self):
-        run = self.submitted()
+    def test_summary_next_prepares_current_archive_without_metadata_fetch(self):
+        run=self.submitted()
         self.video(OTHER)
-        result = ytg.advance(self.s,run,CID,VID,'summary','主题','youtube-content-complete',self.fetch)
-        self.assertEqual(result['next']['state'],'reserved')
-        self.assertEqual(result['next']['id'],OTHER)
-        self.assertIn('prompt',result['next'])
+        result=ytg.advance(self.s,run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete',self.fetch)
+        self.assertEqual(result['next']['state'],'summarized')
+        self.assertEqual(result['next']['id'],VID)
+        self.assertIn('expected_title',result['next'])
+        self.assertEqual(self.s.video(CID,OTHER)['state'],'pending')
+        self.assertEqual(self.fetches,1)
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
     def test_break_finalization_keeps_prepared_generation_and_orders_backlog(self):
@@ -140,12 +136,12 @@ class EfficiencyTests(unittest.TestCase):
         self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
         self.video(OTHER)
         next_item = ytg.prepare(self.s,run,self.fetch)
-        self.assertEqual(next_item['id'],OTHER)
+        self.assertEqual(next_item['id'],VID)
         item = self.s.finalize(run)
         self.assertEqual(item['id'],VID)
         self.assertEqual(item['phase'],'finalize')
         self.assertEqual(self.s.finalize(run)['id'],VID)
-        self.assertEqual(self.s.video(CID,OTHER)['state'],'reserved')
+        self.assertEqual(self.s.video(CID,OTHER)['state'],'pending')
         title = item['expected_title']
         self.s.transition(run,CID,VID,'renamed',title)
         self.s.transition(run,CID,VID,'verify',title,'reopen-video-summary')
@@ -188,13 +184,13 @@ class EfficiencyTests(unittest.TestCase):
         self.s.transition(run,CID,VID,'renamed',title)
         self.assertEqual(self.s.finalize(run)['id'],VID)
 
-    def test_break_finalization_requires_live_history_lease(self):
+    def test_finalization_requires_live_lease_and_respects_incremental_mode(self):
         run = self.submitted()
         self.s.db.execute('UPDATE lease SET expires=0')
         with self.assertRaises(ytg.Stop): self.s.finalize(run)
         self.s.db.execute('UPDATE lease SET expires=?',(time.time()+900,))
         self.s.db.execute("UPDATE runs SET mode='incremental' WHERE id=?",(run,))
-        with self.assertRaises(ytg.Stop): self.s.finalize(run)
+        self.assertEqual(self.s.finalize(run),{'stop':'no_finalize'})
 
     def test_break_finalization_cli_never_claims_pending_video(self):
         self.video()
@@ -213,21 +209,22 @@ class EfficiencyTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop): ytg.advance(self.s,run,CID,VID,'arm',None,None,self.fetch)
         self.assertEqual(self.s.video(CID,VID)['state'],'reserved')
 
-    def test_daily_handoff_preserves_summaries_and_resumes_history(self):
-        run = self.submitted()
-        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+    def test_daily_handoff_waits_for_current_archive_then_runs_incremental(self):
+        run=self.submitted()
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
         with patch('ytg.now',return_value=datetime(2026,10,27,5,0)):
+            item=ytg.prepare(self.s,run,self.fetch)
+            self.assertEqual(item['state'],'summarized')
+            with self.assertRaises(ytg.Stop): self.s.park(run)
+            self.s.transition(run,CID,VID,'renamed',item['expected_title'])
+            self.s.transition(run,CID,VID,'verify',item['expected_title'],ytg.CURRENT_PAGE_EVIDENCE)
             self.assertEqual(ytg.prepare(self.s,run,self.fetch)['stop'],'daily_due')
             self.s.park(run)
-            self.assertEqual(self.s.video(CID,VID)['state'],'summarized')
-            daily = self.s.begin('incremental',scheduled=True)['id']
+            daily=self.s.begin('incremental',scheduled=True)['id']
             self.assertEqual(self.s.reserve(daily),{'stop':'empty'})
             self.s.end(daily)
-            resumed = self.s.begin('history')['id']
-            item = ytg.prepare(self.s,resumed,self.fetch)
-            self.assertEqual(item['id'],VID)
-            self.assertEqual(item['phase'],'finalize')
-            self.assertEqual(item['chat'],CHAT)
+            resumed=self.s.begin('history')['id']
+            self.assertEqual(ytg.prepare(self.s,resumed,self.fetch),{'stop':'empty'})
 
     def test_daily_handoff_waits_for_active_generation(self):
         run = self.submitted()

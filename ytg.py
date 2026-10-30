@@ -8,6 +8,7 @@ import argparse
 import contextlib
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,9 @@ import uuid
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pacing(scope TEXT PRIMARY KEY, processed INTEGER NOT NULL DEFAULT 0,
+ break_started REAL);
+CREATE TABLE IF NOT EXISTS pauses(scope TEXT PRIMARY KEY, reason TEXT NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS channels(
  id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
  notebook TEXT UNIQUE, initialized INTEGER NOT NULL DEFAULT 0,
@@ -29,11 +33,13 @@ CREATE TABLE IF NOT EXISTS scans(
  count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
  checked TEXT NOT NULL, PRIMARY KEY(channel_id,tab));
 CREATE TABLE IF NOT EXISTS runs(
- id TEXT PRIMARY KEY, mode TEXT NOT NULL, schedule_key TEXT UNIQUE,
- armed INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0);
+ id TEXT PRIMARY KEY, mode TEXT NOT NULL, channel_id TEXT, schedule_key TEXT UNIQUE,
+ policy TEXT NOT NULL DEFAULT 'strict',
+ armed INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0,
+ batch_count INTEGER NOT NULL DEFAULT 0, batch_started REAL, phase TEXT NOT NULL DEFAULT 'generate');
 CREATE TABLE IF NOT EXISTS lease(
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), run_id TEXT NOT NULL,
- expires REAL NOT NULL);
+ expires REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS videos(
  channel_id TEXT NOT NULL REFERENCES channels(id), id TEXT NOT NULL,
  title TEXT NOT NULL, published TEXT, history INTEGER NOT NULL,
@@ -50,6 +56,13 @@ SCAN_WINDOW = 50
 SCAN_OVERLAP = 10
 REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
            'source_unavailable','metadata_unavailable','live_not_ready','ambiguous_match','save_unverified'}
+GLOBAL_PAUSES = {'quota','login','captcha','ui_changed','network'}
+BREAK_EVERY = 20
+BREAK_SECONDS = 120
+REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
+REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
+CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
+COLLECT_REASONS = {'generation_timeout','submission_unconfirmed','chat_unidentified','content_failed','archive_unverified','source_unavailable','metadata_unavailable','live_not_ready'}
 
 class Stop(Exception):
     pass
@@ -100,7 +113,16 @@ def title_for(row, topic=None):
 
 def metadata_fresh(row):
     checked = row['metadata_checked']
-    return checked is not None and 0 <= time.time()-checked < METADATA_TTL
+    return checked is not None and bool(row['published']) and (bool(row['history']) or 0 <= time.time()-checked < METADATA_TTL)
+
+def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None):
+    if blocker:
+        return 'stop'
+    if complete and substantive:
+        return 'summary'
+    if elapsed >= 300 or (elapsed >= 120 and not (substantive and growing)):
+        return 'defer'
+    return 'wait'
 
 class Store:
     def __init__(self,path):
@@ -108,6 +130,7 @@ class Store:
         self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
+        had_pacing = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacing'").fetchone())
         self.db.executescript(SCHEMA)
         # Older task databases are upgraded in place without resetting task state.
         columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
@@ -116,6 +139,50 @@ class Store:
                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
                 if 'metadata_checked' not in columns:
                     self.db.execute('ALTER TABLE videos ADD COLUMN metadata_checked REAL')
+        run_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
+        with self.tx():
+            if 'channel_id' not in run_columns:
+                self.db.execute('ALTER TABLE runs ADD COLUMN channel_id TEXT')
+            if 'policy' not in run_columns:
+                self.db.execute("ALTER TABLE runs ADD COLUMN policy TEXT NOT NULL DEFAULT 'strict'")
+            if 'batch_count' not in run_columns:
+                self.db.execute('ALTER TABLE runs ADD COLUMN batch_count INTEGER NOT NULL DEFAULT 0')
+            if 'batch_started' not in run_columns:
+                self.db.execute('ALTER TABLE runs ADD COLUMN batch_started REAL')
+            if 'phase' not in run_columns:
+                self.db.execute("ALTER TABLE runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'generate'")
+        with self.tx():
+            for name, declaration in [('failure_streak','INTEGER NOT NULL DEFAULT 0'), ('health_after','REAL'), ('health_probe','INTEGER NOT NULL DEFAULT 0')]:
+                if name not in run_columns:
+                    self.db.execute(f'ALTER TABLE runs ADD COLUMN {name} {declaration}')
+            if 'deferral_policy' not in columns:
+                self.db.execute("ALTER TABLE videos ADD COLUMN deferral_policy TEXT NOT NULL DEFAULT 'strict'")
+            if 'retry_count' not in columns:
+                self.db.execute('ALTER TABLE videos ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0')
+        with self.tx():
+            if 'processed_counted' not in columns:
+                self.db.execute('ALTER TABLE videos ADD COLUMN processed_counted INTEGER NOT NULL DEFAULT 0')
+                # Older collect-first counted at summary time; do not count those
+                # items again when their outstanding archive is verified.
+                self.db.execute("UPDATE videos SET processed_counted=1 WHERE state IN ('verified','deferred') OR (state IN ('summarized','renamed') AND (owner IN (SELECT id FROM runs WHERE policy='collect-first') OR (owner IS NULL AND channel_id IN (SELECT channel_id FROM runs WHERE policy='collect-first'))))")
+            if 'reopen_required' not in columns:
+                self.db.execute('ALTER TABLE videos ADD COLUMN reopen_required TEXT')
+                self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE state IN ('summarized','renamed')")
+            if not had_pacing or self.setting('pacing_version')!='2':
+                seen=set()
+                for r in self.db.execute('SELECT * FROM runs ORDER BY rowid DESC').fetchall():
+                    key=r['channel_id'] or '*'
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    reliable='batch_count' in run_columns and r['channel_id'] and r['policy']=='collect-first'
+                    count=r['batch_count'] if reliable else BREAK_EVERY
+                    started=(r['batch_started'] if reliable and count>=BREAK_EVERY else None)
+                    if count>=BREAK_EVERY and started is None:
+                        started=time.time()
+                    self.db.execute('INSERT OR IGNORE INTO pacing VALUES(?,?,?)',(key,count,started))
+                self.set('pacing_version','2')
+        self._migrate_pause()
 
     @contextlib.contextmanager
     def tx(self):
@@ -128,11 +195,55 @@ class Store:
             raise
 
     def setting(self,key,default=''):
+        if key=='pause':
+            row=self.db.execute("SELECT reason FROM pauses WHERE scope='*'").fetchone()
+            return row[0] if row else default
         row = self.db.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
         return row[0] if row else default
 
     def set(self,key,value):
+        if key=='pause':
+            with self.tx():
+                if value:
+                    self.db.execute("INSERT OR REPLACE INTO pauses VALUES('*',?,?)",(value,time.time()))
+                else:
+                    self.db.execute('DELETE FROM pauses')
+            return
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,str(value)))
+
+    def _migrate_pause(self):
+        row=self.db.execute("SELECT value FROM settings WHERE key='pause'").fetchone()
+        if not row or not row[0]: return
+        reason=row[0]
+        with self.tx():
+            if reason in GLOBAL_PAUSES:
+                self.db.execute("INSERT OR REPLACE INTO pauses VALUES('*',?,?)",(reason,time.time()))
+            else:
+                ids=[x[0] for x in self.db.execute('SELECT DISTINCT channel_id FROM videos WHERE reason=?',(reason,))]
+                for cid in ids:
+                    self.db.execute("INSERT OR REPLACE INTO pauses VALUES(?,?,?)",(cid,reason,time.time()))
+                if not ids:
+                    self.db.execute("INSERT OR REPLACE INTO pauses VALUES('*',?,?)",(reason,time.time()))
+            self.db.execute("DELETE FROM settings WHERE key='pause'")
+
+    def pause_for(self,cid=None):
+        row=self.db.execute("SELECT reason FROM pauses WHERE scope='*'").fetchone()
+        if row: return row[0]
+        if cid:
+            row=self.db.execute('SELECT reason FROM pauses WHERE scope=?',(cid,)).fetchone()
+            return row[0] if row else ''
+        row=self.db.execute('SELECT reason FROM pauses ORDER BY updated DESC LIMIT 1').fetchone()
+        return row[0] if row else ''
+
+    def set_pause(self,reason,cid=None):
+        scope='*' if reason in GLOBAL_PAUSES else (cid or '*')
+        self.db.execute('INSERT OR REPLACE INTO pauses VALUES(?,?,?)',(scope,reason,time.time()))
+
+    def clear_pause(self,cid=None):
+        self.db.execute('DELETE FROM pauses WHERE scope=?',(cid or '*',))
+
+    def pause_status(self):
+        return [dict(x) for x in self.db.execute("SELECT NULLIF(scope,'*') AS channel_id,reason,updated FROM pauses ORDER BY updated DESC")]
 
     def channel(self,cid):
         r = self.db.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
@@ -157,24 +268,43 @@ class Store:
           seen=excluded.seen,missing=0,
           metadata_checked=CASE WHEN videos.state='pending' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
           title=CASE WHEN videos.state='pending' THEN excluded.title ELSE videos.title END,
-          state=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' THEN 'pending' ELSE videos.state END,
-          reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' THEN NULL ELSE videos.reason END''',
+          processed_counted=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 0 ELSE videos.processed_counted END,
+          state=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 'pending' ELSE videos.state END,
+          reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN NULL ELSE videos.reason END''',
           (cid,vid,title,entry.get('upload_date'),int(history),time.time_ns(),stamp))
+        if history and entry.get('upload_date'):
+            try:
+                date_value(entry['upload_date'])
+            except Stop:
+                return
+            self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=? AND published=? AND metadata_checked IS NULL", (time.time(),cid,vid,title,entry['upload_date']))
+
 
     def check_lease(self,run):
         r = self.db.execute('SELECT * FROM lease WHERE singleton=1').fetchone()
         if not r or r['run_id'] != run or r['expires'] < time.time():
             raise Stop('Run has no live lease; reopen the same run before continuing')
-        if self.setting('pause'):
-            raise Stop('Paused: '+self.setting('pause'))
-        self.db.execute('UPDATE lease SET expires=? WHERE singleton=1',(time.time()+900,))
+        run_row=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(run,)).fetchone()
+        reason=self.pause_for(run_row['channel_id'] if run_row else None)
+        if reason:
+            raise Stop('Paused: '+reason)
+        self.db.execute('UPDATE lease SET expires=?,last_seen=? WHERE singleton=1',(time.time()+900,time.time()))
 
-    def begin(self,mode,scheduled=False):
+    def begin(self,mode,scheduled=False,channel_id=None,policy='strict',run_id=None):
         with self.tx():
             if mode not in {'history','incremental'}:
                 raise Stop('Unknown run mode')
-            if self.setting('pause'):
-                raise Stop('Paused: '+self.setting('pause'))
+            if policy not in {'strict','collect-first'} or (policy=='collect-first' and (mode!='history' or not channel_id)):
+                raise Stop('collect-first requires a channel-scoped historical run')
+            if run_id:
+                saved=self.db.execute('SELECT * FROM runs WHERE id=?',(run_id,)).fetchone()
+                if not saved or saved['finished'] or saved['mode']!=mode or saved['channel_id']!=channel_id:
+                    raise Stop('Cannot reopen a finished, missing, or differently scoped run')
+                policy=saved['policy']
+            reason=self.pause_for(channel_id)
+            if reason:
+                raise Stop('Paused: '+reason)
+            if channel_id: self.channel(channel_id)
             t = now()
             key = None
             if scheduled:
@@ -187,54 +317,140 @@ class Store:
             if old and old['expires'] > time.time():
                 raise Stop('Another worker owns the queue')
             if old:
-                self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE state='reserved'")
-                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE state='submitting'")
+                self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE state='reserved' AND owner=?",(old['run_id'],))
+                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE state='submitting' AND owner=?",(old['run_id'],))
+            scope=' AND channel_id=?' if channel_id else ''
+            self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE state IN ('submitted','summarized','renamed')"+scope,(channel_id,) if channel_id else ())
             existing = self.db.execute('SELECT * FROM runs WHERE schedule_key=?',(key,)).fetchone() if key else None
             if existing and existing['finished']:
                 raise Stop('This scheduled round is already finished')
-            rid = existing['id'] if existing else uuid.uuid4().hex
-            if not existing:
-                self.db.execute('INSERT INTO runs(id,mode,schedule_key) VALUES(?,?,?)',(rid,mode,key))
-            self.db.execute('INSERT OR REPLACE INTO lease VALUES(1,?,?)',(rid,time.time()+900))
+            rid = run_id or (existing['id'] if existing else uuid.uuid4().hex)
+            if not existing and not run_id:
+                self.db.execute('INSERT INTO runs(id,mode,channel_id,schedule_key,policy) VALUES(?,?,?,?,?)',(rid,mode,channel_id,key,policy))
+                if policy=='collect-first':
+                    previous=self.db.execute("SELECT * FROM runs WHERE channel_id=? AND policy='collect-first' AND id<>? ORDER BY rowid DESC LIMIT 1",(channel_id,rid)).fetchone()
+                    if previous:
+                        self.db.execute('UPDATE runs SET failure_streak=?,health_after=?,health_probe=? WHERE id=?',tuple(previous[k] for k in ('failure_streak','health_after','health_probe'))+(rid,))
+
+            self._sync_pacing(rid)
+            self.db.execute('INSERT OR REPLACE INTO lease(singleton,run_id,expires,last_seen) VALUES(1,?,?,?)',(rid,time.time()+900,time.time()))
             return dict(self.db.execute('SELECT * FROM runs WHERE id=?',(rid,)).fetchone())
+
+    def _sync_pacing(self,run):
+        r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
+        key=r['channel_id'] or '*'
+        self.db.execute('INSERT OR IGNORE INTO pacing(scope) VALUES(?)',(key,))
+        pace=self.db.execute('SELECT * FROM pacing WHERE scope=?',(key,)).fetchone()
+        self.db.execute('UPDATE runs SET batch_count=?,batch_started=? WHERE id=?',(pace['processed'],pace['break_started'],run))
+        return pace
+
+    def _break_remaining(self,run):
+        pace=self._sync_pacing(run)
+        if pace['processed']<BREAK_EVERY:
+            return 0
+        started=pace['break_started']
+        if started is None:
+            started=time.time()
+            self.db.execute('UPDATE pacing SET break_started=? WHERE scope=?',(started,pace['scope']))
+        remaining=max(0,math.ceil(started+BREAK_SECONDS-time.time()))
+        if remaining==0:
+            self.db.execute('UPDATE pacing SET processed=0,break_started=NULL WHERE scope=?',(pace['scope'],))
+        self._sync_pacing(run)
+        return remaining
+
+    def _count_processed(self,run,cid,vid):
+        v=self.video(cid,vid)
+        if v['processed_counted']:
+            return
+        if run is None:
+            self.db.execute('INSERT OR IGNORE INTO pacing(scope) VALUES(?)',(cid,))
+            key=cid
+        else:
+            key=self._sync_pacing(run)['scope']
+        self.db.execute('UPDATE videos SET processed_counted=1 WHERE channel_id=? AND id=?',(cid,vid))
+        self.db.execute('UPDATE pacing SET processed=processed+1,break_started=CASE WHEN processed=? THEN ? ELSE break_started END WHERE scope=?',(BREAK_EVERY-1,time.time(),key))
+        if run is not None:
+            self._sync_pacing(run)
 
     def reserve(self,run,parallel=False):
         with self.tx():
             self.check_lease(run)
-            r = self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
-            history = int(r['mode']=='history')
             if parallel:
-                if not history:
-                    raise Stop('Parallel reservation is only supported for history')
-                if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('reserved','uncertain') LIMIT 1").fetchone():
-                    raise Stop('Resolve the existing reservation or uncertain submission before reserving another')
-            # Finish the active browser action first. Historical summaries can wait
-            # for renaming while generation advances; uncertain submissions cannot.
-            active = "('reserved','submitting','submitted','renamed','uncertain')" if history else "('reserved','submitting','submitted','summarized','renamed','uncertain')"
-            row = None
-            if not parallel:
-                row = self.db.execute(f"SELECT * FROM videos WHERE owner=? AND state IN {active} ORDER BY found LIMIT 1",(run,)).fetchone()
-                if row:
-                    return self.payload(row)
-                recover = "('submitting','submitted','renamed','uncertain')" if history else "('submitting','submitted','summarized','renamed','uncertain')"
-                row = self.db.execute(f"SELECT * FROM videos WHERE history=? AND state IN {recover} ORDER BY found LIMIT 1",(history,)).fetchone()
-            if not row:
-                if not history and r['armed']>=20:
-                    return {'stop':'round_cap','armed':r['armed']}
-                row = self.db.execute('''SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_id
-                  WHERE v.state='pending' AND v.history=? AND c.initialized=1 AND c.notebook IS NOT NULL AND v.missing=0
-                  ORDER BY c.turn ASC,COALESCE(v.published,'') DESC,v.found ASC LIMIT 1''',(history,)).fetchone()
-                if row:
-                    self.db.execute("UPDATE videos SET state='reserved',owner=? WHERE channel_id=? AND id=?",(run,row['channel_id'],row['id']))
-                elif history and parallel and self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state='submitted' LIMIT 1").fetchone():
-                    return {'stop':'awaiting_summaries'}
-                elif history:
-                    row = self.db.execute("SELECT * FROM videos WHERE history=1 AND state='summarized' ORDER BY found LIMIT 1").fetchone()
-                if not row:
-                    return {'stop':'empty'}
-            self.db.execute('UPDATE videos SET owner=? WHERE channel_id=? AND id=?',(run,row['channel_id'],row['id']))
-            self.db.execute('UPDATE channels SET turn=? WHERE id=?',(time.time_ns(),row['channel_id']))
-            return self.payload(self.video(row['channel_id'],row['id']))
+                raise Stop('Video processing is strictly serial')
+            return self._reserve_serial(run)
+
+    def _reserve_serial(self,run,archive_only=False):
+        r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
+        history=int(r['mode']=='history')
+        scope=' AND channel_id=?' if r['channel_id'] else ''
+        args=(history,r['channel_id']) if r['channel_id'] else (history,)
+        active=self.db.execute("SELECT * FROM videos WHERE history=? AND state IN ('submitting','submitted','uncertain')"+scope+' ORDER BY found LIMIT 1',args).fetchone()
+        if active:
+            if archive_only:
+                raise Stop('Resolve the active submission before finalization')
+            return self._claim(run,active)
+        backlog=self.db.execute("SELECT * FROM videos WHERE history=? AND state IN ('summarized','renamed')"+scope+" ORDER BY (state='renamed') DESC,found LIMIT 1",args).fetchone()
+        if backlog:
+            self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
+            return self._claim(run,backlog)
+        self.db.execute("UPDATE runs SET phase='generate' WHERE id=?",(run,))
+        if archive_only:
+            return {'stop':'no_finalize'}
+        pending=self.db.execute("SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=? AND v.state IN ('pending','reserved') AND v.missing=0 AND c.initialized=1 AND c.notebook IS NOT NULL"+(' AND v.channel_id=?' if r['channel_id'] else '')+" ORDER BY (v.state='reserved') DESC,c.turn,COALESCE(v.published,'') DESC,v.found LIMIT 1",args).fetchone()
+        if not pending:
+            return {'stop':'empty'}
+        if r['mode']=='incremental' and r['armed']>=20:
+            return {'stop':'round_cap','armed':r['armed']}
+        remaining=self._break_remaining(run)
+        if remaining:
+            return {'stop':'break_required','seconds_remaining':remaining}
+        if r['policy']=='collect-first' and r['health_after']:
+            remaining=max(0,math.ceil(r['health_after']-time.time()))
+            if remaining:
+                return {'stop':'health_cooldown','seconds_remaining':remaining}
+            self.db.execute('UPDATE runs SET health_probe=1,health_after=0 WHERE id=?',(run,))
+        self.db.execute("UPDATE videos SET state='reserved' WHERE channel_id=? AND id=?",(pending['channel_id'],pending['id']))
+        return self._claim(run,pending)
+
+    def _claim(self,run,item):
+        if item['owner']!=run and item['state'] in {'submitted','summarized','renamed'}:
+            self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE channel_id=? AND id=?",(item['channel_id'],item['id']))
+        self.db.execute('UPDATE videos SET owner=? WHERE channel_id=? AND id=?',(run,item['channel_id'],item['id']))
+        self.db.execute('UPDATE channels SET turn=? WHERE id=?',(time.time_ns(),item['channel_id']))
+        return self.payload(self.video(item['channel_id'],item['id']))
+
+    def finalize(self,run):
+        with self.tx():
+            self.check_lease(run)
+            return self._reserve_serial(run,archive_only=True)
+
+    def cleanup(self,run):
+        with self.tx():
+            lease=self.db.execute('SELECT * FROM lease WHERE singleton=1').fetchone()
+            if lease and lease['run_id']!=run:
+                raise Stop('Cannot clean another worker lease')
+            if not self.db.execute('SELECT 1 FROM runs WHERE id=?',(run,)).fetchone():
+                raise Stop('Unknown run')
+            self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE owner=? AND state='reserved'",(run,))
+            self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE owner=? AND state='submitting'",(run,))
+            self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state IN ('submitted','summarized','renamed')",(run,))
+            self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
+            return {'cleaned':True}
+
+    def adopt_unknown(self,cid,evidence):
+        with self.tx():
+            if evidence!='notebook-identity-checked':
+                raise Stop('Notebook identity evidence required')
+            self.channel(cid)
+            if self.db.execute('SELECT 1 FROM lease WHERE expires>?',(time.time(),)).fetchone():
+                raise Stop('Another worker owns the queue')
+            items=self.db.execute("SELECT id FROM videos WHERE channel_id=? AND history=1 AND state IN ('uncertain','submitting')",(cid,)).fetchall()
+            for item in items:
+                self._count_processed(None,cid,item['id'])
+            result=self.db.execute("UPDATE videos SET state='deferred',reason='submission_unconfirmed',owner=NULL WHERE channel_id=? AND history=1 AND state IN ('uncertain','submitting')",(cid,))
+            if not self.db.execute("SELECT 1 FROM videos WHERE channel_id=? AND state IN ('uncertain','submitting')",(cid,)).fetchone():
+                self.db.execute("DELETE FROM pauses WHERE scope=? AND reason='unknown_submit'",(cid,))
+            return {'adopted':result.rowcount}
 
     def payload(self,row):
         d = dict(row)
@@ -260,19 +476,23 @@ class Store:
         """Release a historical worker at a safe boundary for the daily round."""
         with self.tx():
             self.check_lease(run)
-            r = self.db.execute('SELECT mode FROM runs WHERE id=?',(run,)).fetchone()
+            r = self.db.execute('SELECT mode,channel_id FROM runs WHERE id=?',(run,)).fetchone()
             if r['mode']!='history':
                 raise Stop('Only a historical round can be parked')
-            if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','renamed','uncertain') LIMIT 1").fetchone():
+            scope=' AND channel_id=?' if r['channel_id'] else ''
+            if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone():
                 raise Stop('Resolve the active chat before parking')
             self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE owner=? AND state='reserved'",(run,))
-            self.db.execute("UPDATE videos SET owner=NULL WHERE owner=? AND state='summarized'",(run,))
+            self.db.execute("UPDATE videos SET owner=NULL,reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state='summarized'",(run,))
             self.db.execute('UPDATE runs SET finished=1 WHERE id=?',(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
 
     def transition(self,run,cid,vid,action,value=None,evidence=None):
         with self.tx():
             self.check_lease(run)
+            current_run=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
+            if current_run['channel_id'] and current_run['channel_id']!=cid:
+                raise Stop('Video is outside run channel scope')
             v = self.video(cid,vid)
             if v['owner'] != run:
                 reclaimable = (
@@ -285,8 +505,19 @@ class Store:
                     raise Stop('Item is not owned by this run')
                 self.db.execute("UPDATE videos SET owner=? WHERE channel_id=? AND id=?",(run,cid,vid))
                 v = self.video(cid,vid)
+            if action in {'renamed','verify'}:
+                active=self.db.execute("SELECT id FROM videos WHERE channel_id=? AND history=? AND state IN ('submitting','submitted','uncertain') LIMIT 1",(cid,v['history'])).fetchone()
+                other=self.db.execute("SELECT id FROM videos WHERE channel_id=? AND history=? AND state='renamed' AND id<>? LIMIT 1",(cid,v['history'],vid)).fetchone()
+                if active or other:
+                    raise Stop('Finish the active chat before another archive action')
             args = (cid,vid)
             if action=='arm':
+                if self._break_remaining(run):
+                    raise Stop('Finish the 120-second break before submitting')
+                scope=' AND channel_id=?' if current_run['channel_id'] else ''
+                params=(v['history'],vid,current_run['channel_id']) if current_run['channel_id'] else (v['history'],vid)
+                if self.db.execute("SELECT 1 FROM videos WHERE history=? AND id<>? AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',params).fetchone():
+                    raise Stop('Finish the current video before submitting another')
                 if v['state']!='reserved' or not v['published'] or not metadata_fresh(v):
                     raise Stop('Only a reserved item with verified metadata can be armed')
                 r = self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
@@ -308,40 +539,63 @@ class Store:
                     raise Stop('Require a completed, content-backed response in the linked chat')
                 title_for(v,value)
                 self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(value,*args))
+                self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
                 self.set('source_failures',0)
+                self.set('source_failures:'+cid,0)
+                self.db.execute('UPDATE runs SET failure_streak=0,health_probe=0,health_after=0 WHERE id=?',(run,))
             elif action=='renamed':
                 if v['state']!='summarized' or value!=title_for(v):
                     raise Stop('Exact title mismatch or summary not completed')
                 self.db.execute("UPDATE videos SET state='renamed' WHERE channel_id=? AND id=?",args)
             elif action=='verify':
-                if v['state'] not in {'renamed','verified'} or value!=title_for(v) or evidence not in {'reopen-video-summary', 'reload-notebook-reopen-video-summary', 'reload-notebook-reopen-marker-summary'}:
-                    raise Stop('Require reopened chat, notebook membership, exact title, original video URL, and summary')
-                self.db.execute("UPDATE videos SET state='verified',owner=NULL,reason=NULL WHERE channel_id=? AND id=?",args)
+                if v['state']!='renamed' or value!=title_for(v) or evidence not in REOPEN_EVIDENCE | {CURRENT_PAGE_EVIDENCE}:
+                    raise Stop('Require exact title, original video URL, complete summary, account and Notebook evidence')
+                if v['reopen_required'] and evidence not in REOPEN_EVIDENCE:
+                    raise Stop('This chat requires reopened verification after '+v['reopen_required'])
+                self.db.execute("UPDATE videos SET state='verified',owner=NULL,reason=NULL,reopen_required=NULL WHERE channel_id=? AND id=?",args)
+                self._count_processed(run,cid,vid)
+            elif action=='require-reopen':
+                if value not in REOPEN_REASONS or v['state'] not in {'submitting','submitted','summarized','renamed','uncertain'}:
+                    raise Stop('Choose a supported reopen reason for an unfinished chat')
+                self.db.execute('UPDATE videos SET reopen_required=? WHERE channel_id=? AND id=?',(value,*args))
             elif action=='uncertain':
                 if v['state'] not in {'submitting','submitted','summarized','renamed','uncertain'}:
                     raise Stop('No submission to reconcile')
-                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE channel_id=? AND id=?",args)
-                self.set('pause','unknown_submit')
+                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit',reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE channel_id=? AND id=?",args)
+                if current_run['policy']=='strict':
+                    self.set_pause('unknown_submit',cid)
             elif action=='defer':
-                if value not in {'source_unavailable','metadata_unavailable','live_not_ready'}:
+                collect=current_run['policy']=='collect-first'
+                allowed=COLLECT_REASONS if collect else {'source_unavailable','metadata_unavailable','live_not_ready','archive_unverified'}
+                if value not in allowed:
                     raise Stop('Unknown deferral reason')
-                if v['state'] not in {'reserved','submitting','submitted','uncertain'}:
+                if v['state'] not in {'reserved','submitting','submitted','uncertain','summarized','renamed'}:
                     raise Stop('Cannot defer an already completed summary or repeat a deferral')
-                self.db.execute("UPDATE videos SET state='deferred',reason=?,owner=NULL,metadata_checked=NULL WHERE channel_id=? AND id=?",(value,*args))
-                if value=='source_unavailable':
-                    failures=int(self.setting('source_failures','0'))+1
+                if v['state'] in {'summarized','renamed'} and value!='archive_unverified':
+                    raise Stop('Preserve generated content as archive_unverified')
+                self.db.execute("UPDATE videos SET state='deferred',reason=?,deferral_policy=?,owner=NULL,metadata_checked=NULL WHERE channel_id=? AND id=?",(value,current_run['policy'],*args))
+                self._count_processed(run,cid,vid)
+                if collect and value in {'generation_timeout','submission_unconfirmed','source_unavailable'}:
+                    if current_run['health_probe']:
+                        self.set_pause('source_unavailable',cid)
+                    else:
+                        self.db.execute('UPDATE runs SET failure_streak=failure_streak+1,health_after=CASE WHEN failure_streak=4 THEN ? ELSE health_after END WHERE id=?',(time.time()+300,run))
+                if not collect and value=='source_unavailable':
+                    failures=int(self.setting('source_failures:'+cid,'0'))+1
+                    self.set('source_failures:'+cid,failures)
                     self.set('source_failures',failures)
                     if failures>=3:
-                        self.set('pause','source_unavailable')
+                        self.set_pause('source_unavailable',cid)
             elif action=='skip':
                 if value not in {'content_mismatch','video_unreadable','summary_failed','other'}:
                     raise Stop('Choose a supported manual-review reason')
-known_failure = v['state']=='submitting' and evidence in {'gemini-refusal','known-video-error'}
+                known_failure = v['state']=='submitting' and evidence in {'gemini-refusal','known-video-error'}
                 confirmed_unsaved = v['state']=='uncertain' and not v['chat'] and evidence=='search-no-result'
                 if (v['state'] not in {'reserved','submitted','uncertain'} and not known_failure) or (v['state']=='submitted' and not v['chat']) or (v['state']=='uncertain' and not v['chat'] and not confirmed_unsaved):
                     raise Stop('Skip requires a known per-video failure; reconcile unknown submissions first')
                 self.db.execute("UPDATE videos SET state='deferred',reason=?,owner=NULL WHERE channel_id=? AND id=?",
                                 ('review:'+value,*args))
+                self._count_processed(run,cid,vid)
             else:
                 raise Stop('Unknown transition')
             return self.payload(self.video(cid,vid))
@@ -359,34 +613,49 @@ known_failure = v['state']=='submitting' and evidence in {'gemini-refusal','know
     def status(self,verbose=True):
         if not verbose:
             lease = self.db.execute('SELECT run_id,expires FROM lease WHERE expires>?',(time.time(),)).fetchone()
-            return {'pause':self.setting('pause'), 'busy':bool(lease),
+            return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'busy':bool(lease),
                     'daily_due':self.daily_due(),
                     'states':[dict(x) for x in self.db.execute('SELECT history,state,count(*) AS count FROM videos GROUP BY history,state')]}
-        return {'pause':self.setting('pause'), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
+        return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
                 'states':[dict(x) for x in self.db.execute('SELECT state,history,count(*) AS count FROM videos GROUP BY state,history')],
                 'scans':[dict(x) for x in self.db.execute('SELECT * FROM scans')],
                 'lease':[dict(x) for x in self.db.execute('SELECT * FROM lease')]}
 
-    def report(self,mode='history'):
+    def report(self,mode='history',channel_id=None):
         if mode not in {'history','incremental'}:
             raise Stop('Unknown report mode')
-        history = int(mode=='history')
-        counts = {r['state']:r['count'] for r in self.db.execute(
-            'SELECT state,count(*) AS count FROM videos WHERE history=? GROUP BY state',(history,))}
-        remaining = sum(counts.get(state,0) for state in
-                        ('pending','reserved','submitting','submitted','summarized','renamed','uncertain','blocked'))
-        if history:
-            remaining -= self.db.execute("SELECT count(*) FROM videos WHERE history=1 AND state='pending' AND missing=1").fetchone()[0]
-        review = [dict(r) for r in self.db.execute(
-            "SELECT channel_id,id,title,reason,chat,missing FROM videos WHERE history=? AND state='deferred' AND reason LIKE 'review:%' ORDER BY found",
-            (history,))]
-        for item in review:
-            item['url'] = 'https://www.youtube.com/watch?v='+item['id']
-        deferred = [dict(r) for r in self.db.execute(
-            "SELECT reason,count(*) AS count FROM videos WHERE history=? AND state='deferred' GROUP BY reason ORDER BY reason",
-            (history,))]
-        return {'mode':mode,'complete':remaining==0,'remaining':remaining,
-                'counts':counts,'deferred':deferred,'manual_review':review}
+        query='SELECT * FROM videos WHERE history=?'
+        params=(int(mode=='history'),)
+        if channel_id:
+            self.channel(channel_id)
+            query+=' AND channel_id=?'
+            params+=(channel_id,)
+        rows=list(self.db.execute(query+' ORDER BY found',params))
+        counts={}
+        review=[]
+        deferred={}
+        generated=0
+        remaining=0
+        total=0
+        for row in rows:
+            counts[row['state']]=counts.get(row['state'],0)+1
+            if row['missing'] and row['state']=='pending':
+                continue
+            total+=1
+            generated+=int(row['state'] in {'summarized','renamed','verified'} or (row['state']=='deferred' and row['reason']=='archive_unverified' and bool(row['topic'])))
+            if row['state']=='deferred':
+                deferred[row['reason']]=deferred.get(row['reason'],0)+1
+                item={k:row[k] for k in ('channel_id','id','title','reason','chat','missing')}
+                item['url']='https://www.youtube.com/watch?v='+row['id']
+                if row['topic'] and row['published']:
+                    item['expected_title']=title_for(row)
+                review.append(item)
+            elif row['state']!='verified':
+                remaining+=1
+        return {'mode':mode,'channel_id':channel_id,'complete':remaining==0,'remaining':remaining,
+                'counts':counts,'deferred':[{'reason':k,'count':v} for k,v in sorted(deferred.items())],
+                'manual_review':review,'generated':generated,'verified':counts.get('verified',0),
+                'not_generated':total-generated,'success_rate':generated/total if total else 0}
 
 class Quiet:
     def debug(self,*a): pass
@@ -423,8 +692,8 @@ def add_channel(s,url):
 
 def scan(s,cid,full=False,fetch=extract,run=None):
     c = s.channel(cid)
-    if s.setting('pause'):
-        raise Stop('Paused: '+s.setting('pause'))
+    if s.pause_for(cid):
+        raise Stop('Paused: '+s.pause_for(cid))
     if run:
         with s.tx():
             s.check_lease(run)
@@ -495,12 +764,20 @@ def metadata(s,run,cid,vid,fetch=extract,force=False):
             raise Stop('Metadata update only allowed for the current reserved item')
         if not force and metadata_fresh(v):
             return s.payload(v)
-    info = fetch('https://www.youtube.com/watch?v='+vid,False)
+    try:
+        info = fetch('https://www.youtube.com/watch?v='+vid,False)
+    except Exception as exc:
+        if any(text in str(exc).lower() for text in ('members-only','private video','video unavailable','video has been removed','video is unavailable')):
+            return s.transition(run,cid,vid,'defer','metadata_unavailable')
+        raise
     if info.get('id')!=vid or info.get('channel_id')!=cid:
         raise Stop('Video/channel identity mismatch')
     if info.get('live_status') in {'is_live','is_upcoming','post_live'}:
         return s.transition(run,cid,vid,'defer','live_not_ready')
-    date = date_value(info.get('release_date') or info.get('upload_date'))
+    try:
+        date = date_value(info.get('release_date') or info.get('upload_date'))
+    except Stop:
+        return s.transition(run,cid,vid,'defer','metadata_unavailable')
     if not isinstance(info.get('title'),str) or not info['title'].strip():
         raise Stop('Metadata did not return an original title')
     with s.tx():
@@ -516,8 +793,9 @@ def prepare(s,run,fetch=extract):
     """Reserve and prepare one item, without ever performing a browser submission."""
     with s.tx():
         s.check_lease(run)
-        r = s.db.execute('SELECT mode FROM runs WHERE id=?',(run,)).fetchone()
-        active = s.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','renamed','uncertain') LIMIT 1").fetchone()
+        r = s.db.execute('SELECT mode,channel_id FROM runs WHERE id=?',(run,)).fetchone()
+        scope=' AND channel_id=?' if r['channel_id'] else ''
+        active = s.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone()
         if r['mode']=='history' and not active and s.daily_due():
             return {'stop':'daily_due','next_action':'park history, run scheduled incremental, then resume history'}
     item = s.reserve(run)
@@ -537,9 +815,9 @@ def compact(item,ack=False):
         return item
     keys = ['channel_id','id','state']
     if ack:
-        keys += ['reason']
+        keys += ['reason','reopen_required']
     else:
-        keys += ['phase','notebook','url','chat','reason']
+        keys += ['phase','notebook','url','chat','reason','reopen_required']
         if item['state']=='reserved':
             keys += ['title','published','prompt']
         if item['state'] in {'summarized','renamed'}:
@@ -566,17 +844,18 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('status')
     a = sub.add_parser('add'); a.add_argument('url')
-    a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini')
+    a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
-    a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true')
+    a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true'); a.add_argument('--channel'); a.add_argument('--policy',choices=['strict','collect-first'],default='strict'); a.add_argument('--run')
     a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
-    for name in ('prepare','park','end','renew'):
+    for name in ('prepare','park','end','renew','finalize','cleanup'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
-    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','attach','summary','renamed','verify','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
-    a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history')
-    a = sub.add_parser('pause'); a.add_argument('reason',choices=sorted(REASONS))
-    a = sub.add_parser('resume'); a.add_argument('--confirmed',action='store_true',required=True)
+    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','attach','summary','renamed','verify','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
+    a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history'); a.add_argument('--channel')
+    a = sub.add_parser('pause'); a.add_argument('reason',choices=sorted(REASONS)); a.add_argument('--channel')
+    a = sub.add_parser('resume'); a.add_argument('--confirmed',action='store_true',required=True); a.add_argument('--channel')
+    a = sub.add_parser('adopt-unknown'); a.add_argument('--channel',required=True); a.add_argument('--evidence',required=True)
     args = p.parse_args(argv)
     s = None
     try:
@@ -584,22 +863,29 @@ def main(argv=None):
             raise Stop('Task database is missing; refusing to create an empty replacement')
         s = Store(args.db)
         if args.cmd=='status': result=s.status(verbose=args.verbose)
-        elif args.cmd=='report': result=s.report(args.mode)
+        elif args.cmd=='report': result=s.report(args.mode,args.channel)
         elif args.cmd=='add': result=add_channel(s,args.url)
         elif args.cmd=='notebook':
             gemini_url(args.url,'notebook')
             with s.tx():
                 c = s.channel(args.channel)
-                if c['notebook'] and c['notebook']!=args.url and not args.replace_missing:
-                    raise Stop('Existing notebook mapping cannot be overwritten; verify it is missing in Gemini, then use --replace-missing')
+                if c['notebook'] and c['notebook']!=args.url:
+                    if args.replace_verified:
+                        if args.evidence != 'account-notebook-checked':
+                            raise Stop('--replace-verified requires --evidence account-notebook-checked')
+                    elif not args.replace_missing:
+                        raise Stop('Existing notebook mapping cannot be overwritten; verify the target account and Notebook in Gemini, then use --replace-verified --evidence account-notebook-checked')
                 s.db.execute('UPDATE channels SET notebook=? WHERE id=?',(args.url,args.channel))
             result=dict(s.channel(args.channel))
         elif args.cmd=='scan':
             ids = [args.channel] if args.channel else [x[0] for x in s.db.execute('SELECT id FROM channels')]
             result=[scan(s,c,args.full or now().weekday()==0,run=args.run) for c in ids]
-        elif args.cmd=='begin': result=s.begin(args.mode,args.scheduled)
+        elif args.cmd=='begin': result=s.begin(args.mode,args.scheduled,args.channel,args.policy,args.run)
         elif args.cmd=='next': result=s.reserve(args.run,args.parallel)
         elif args.cmd=='prepare': result=prepare(s,args.run)
+        elif args.cmd=='finalize': result=s.finalize(args.run)
+        elif args.cmd=='cleanup': result=s.cleanup(args.run)
+        elif args.cmd=='adopt-unknown': result=s.adopt_unknown(args.channel,args.evidence)
         elif args.cmd=='park': s.park(args.run); result={'parked':True}
         elif args.cmd=='end': s.end(args.run); result={'ended':True}
         elif args.cmd=='renew':
@@ -612,14 +898,16 @@ def main(argv=None):
             else:
                 result=s.transition(args.run,args.channel,args.video,args.action,args.value,args.evidence)
         elif args.cmd=='pause':
-            with s.tx(): s.set('pause',args.reason)
-            result={'paused':args.reason}
+            if args.reason in GLOBAL_PAUSES and args.channel: raise Stop('Global pause reasons cannot use --channel')
+            if args.reason not in GLOBAL_PAUSES and not args.channel: raise Stop('Channel pause reasons require --channel')
+            with s.tx(): s.set_pause(args.reason,args.channel)
+            result={'paused':args.reason,'channel_id':args.channel}
         elif args.cmd=='resume':
             # Must only be called after human approval; never by a timer.
             with s.tx():
-                s.set('pause','')
+                s.clear_pause(args.channel)
                 s.db.execute('UPDATE lease SET expires=0')
-            result={'resumed':True}
+            result={'resumed':True,'channel_id':args.channel}
         if not args.verbose and isinstance(result,dict):
             result=compact(result,ack=args.cmd=='step')
         print(json.dumps(result,ensure_ascii=False,separators=(',',':')))

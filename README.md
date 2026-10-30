@@ -42,7 +42,7 @@ python ytg.py status
 
 工作器使用 `prepare RUN` 合并领取任务和元数据检查，用 `step ... summary --next` / `verify --next` 完成当前项并准备下一项。状态更新默认只返回确认信息，排错时才用 `--verbose`。普通状态命令已自动续租，不逐条额外 renew。
 
-历史总结复用同一个 Gemini 标签：每次发送视频链接和“总结”并登记独立会话后，继续提交下一条，不等待前一条生成完成；之后逐一重开核验。
+历史与增量处理复用同一个 Gemini 工作标签：每条发送视频链接和“总结”，等待生成完成后立即改名并核验，再处理下一条。正常条目在当前页核对标题、完整正文、原视频链接、账号与 Notebook；操作报错、页面中断、标题未更新或归属不明时，记录标记后在同一标签重新打开已有聊天核验。每20条结清后休息至少2分钟，计数和休息起点跨续跑保留；连续失败健康冷却另按 WORKER 执行。
 
 日常扫描各类最新50条，有10条已知重叠时停止，无重叠则全量回退；周一仍全量核对。窗口外延迟公开的视频可能到周一才被发现。历史工作器在安全边界让出队列补做当天增量，再继续历史任务。
 
@@ -66,7 +66,7 @@ python ytg.py status
 
 Give the tool a YouTube channel URL. It inventories public videos, Shorts, and streams, then generates all available historical summaries before renaming and verifying the chats. Each video gets its own summary chat inside that channel's Gemini Notebook. New uploads are checked every day at 05:00 Windows local time; Monday also verifies the full channel list. A scheduled round permits up to 20 new submissions across all channels.
 
-Chats are named `YYYYMMDD-topic-full original video title` after summarization, then reopened using their saved chat URLs to verify the title, content, and Notebook membership. Tasks are deduplicated by channel and video ID, prioritize new videos, and rotate between channels. Confirmed per-video errors are skipped and listed for manual review in the final report. Historical processing has no overall 20-video cap; account-wide quota, login, CAPTCHA, browser failures, and unknown submissions still pause safely.
+Chats are named `YYYYMMDD-topic-full original video title` immediately after each summary. Normally verify the exact title, complete summary, original video link, account and Notebook on the current page before processing another video. Operation errors, page interruption, an unchanged title or unclear membership require a persistent flag and verification after reopening the saved chat in the same working tab. Rest at least120 seconds after every20 settled videos; counts survive restarts and history/incremental handoffs. Health cooldown remains separate. Tasks are deduplicated by channel and video ID. Historical processing has no overall submission cap; the incremental cap remains20. Deferred items are included in the final report, and pause scope follows WORKER.
 
 **The result:** a channel-by-channel, searchable collection of Gemini chats. This project does not export Obsidian notes or guarantee that model summaries are factually correct.
 

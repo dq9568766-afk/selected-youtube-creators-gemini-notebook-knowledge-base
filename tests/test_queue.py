@@ -87,7 +87,7 @@ class QueueTests(unittest.TestCase):
         run=self.claimed(); self.s.transition(run,CID,VID,'arm')
         self.s.transition(run,CID,VID,'uncertain')
         with self.assertRaises(ytg.Stop): self.s.reserve(run)
-        self.assertEqual(self.s.setting('pause'),'unknown_submit')
+        self.assertEqual(self.s.pause_for(CID),'unknown_submit')
 
     def test_attach_requires_video_evidence(self):
         run=self.claimed(); self.s.transition(run,CID,VID,'arm')
@@ -131,40 +131,41 @@ class QueueTests(unittest.TestCase):
         self.s.transition(run,CID,VID,'skip','video_unreadable')
         self.assertTrue(self.s.report()['complete'])
 
-    def test_history_generates_over_twenty_before_finalizing(self):
-        for i in range(22):
-            self.video(f'{i:011d}')
+    def test_history_processes_over_twenty_with_serial_archive_and_break(self):
+        for i in range(22): self.video(f'{i:011d}')
         run=self.s.begin('history')['id']
-        chats=[]
         for i in range(22):
+            if i==20:
+                self.assertEqual(self.s.reserve(run)['stop'],'break_required')
+                self.s.db.execute('UPDATE pacing SET break_started=?',(time.time()-120,))
             item=self.s.reserve(run)
             self.assertEqual(item['state'],'reserved')
-            self.assertEqual(item['phase'],'generate')
             vid=item['id']
-            chat='https://gemini.google.com/app/'+f'{i:016x}'
             self.s.transition(run,CID,vid,'arm')
-            self.s.transition(run,CID,vid,'attach',chat,'video-match')
-            self.s.transition(run,CID,vid,'summary','主题','youtube-content-complete')
-            chats.append(chat)
-        self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],22)
-        with self.assertRaises(ytg.Stop): self.s.end(run)
-        for _ in range(22):
+            self.s.transition(run,CID,vid,'attach','https://gemini.google.com/app/'+f'{i:016x}','video-match')
+            self.s.transition(run,CID,vid,'summary','\u4e3b\u9898','youtube-content-complete')
             item=self.s.reserve(run)
+            self.assertEqual(item['id'],vid)
             self.assertEqual(item['phase'],'finalize')
-            self.assertIn(item['chat'],chats)
-            self.s.transition(run,CID,item['id'],'renamed',item['expected_title'])
-            self.s.transition(run,CID,item['id'],'verify',item['expected_title'],'reopen-video-summary')
+            self.s.transition(run,CID,vid,'renamed',item['expected_title'])
+            self.s.transition(run,CID,vid,'verify',item['expected_title'],ytg.CURRENT_PAGE_EVIDENCE)
+        self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],22)
         self.assertEqual(self.s.reserve(run),{'stop':'empty'})
         self.s.end(run)
 
-    def test_history_resume_skips_saved_summary_until_generation_done(self):
+    def test_history_resume_finishes_saved_archive_before_next_generation(self):
         run=self.claimed()
         self.s.transition(run,CID,VID,'arm')
         self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
-        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
         self.video('aaaaaaaaaaa')
         self.expire()
         new=self.s.begin('history')['id']
+        item=self.s.reserve(new)
+        self.assertEqual(item['id'],VID)
+        self.assertEqual(item['reopen_required'],'page_interrupted')
+        self.s.transition(new,CID,VID,'renamed',item['expected_title'])
+        self.s.transition(new,CID,VID,'verify',item['expected_title'],'reopen-video-summary')
         self.assertEqual(self.s.reserve(new)['id'],'aaaaaaaaaaa')
         self.s.transition(new,CID,'aaaaaaaaaaa','arm')
         self.expire()
@@ -303,7 +304,7 @@ class QueueTests(unittest.TestCase):
             v=self.s.reserve(run)
             self.s.transition(run,CID,v['id'],'arm')
             self.s.transition(run,CID,v['id'],'defer','source_unavailable')
-        self.assertEqual(self.s.setting('pause'),'source_unavailable')
+        self.assertEqual(self.s.pause_for(CID),'source_unavailable')
         with self.assertRaises(ytg.Stop): self.s.reserve(run)
 
 if __name__=='__main__': unittest.main()
