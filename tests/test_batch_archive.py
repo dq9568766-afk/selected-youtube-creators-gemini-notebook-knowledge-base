@@ -277,7 +277,7 @@ class PerVideoArchiveTests(unittest.TestCase):
 
     def test_generation_and_health_timeouts_remain_separate(self):
         self.assertEqual(ytg.generation_decision(30,substantive=True,complete=True),'summary')
-        self.assertEqual(ytg.generation_decision(120),'defer')
+        self.assertEqual(ytg.generation_decision(20,retry_count=1),'defer')
         self.assertEqual(ytg.generation_decision(300,substantive=True,growing=True),'defer')
         for _ in range(5):
             item=self.s.reserve(self.run)

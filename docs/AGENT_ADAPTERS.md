@@ -12,7 +12,7 @@
 2. 在项目根目录运行 `python ytg.py status`，并读取结构化结果。
 3. 在不复制数据库的前提下访问项目配置的唯一任务数据库；本项目当前 Windows 部署使用 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`。
 4. 通过用户已有的登录会话打开和操作 Gemini 网页，查看实际消息、生成结果、聊天 URL 和 Notebook 归属。
-5. 在不确定消息是否提交时保留证据并遵守运行策略：strict暂停，collect-first按docs/WORKER.md登记单条延期；首轮不重发。
+5. 在不确定消息是否提交时保留证据并遵守运行策略：strict暂停，collect-first按docs/WORKER.md登记单条延期；未知提交不重发。仅已确认提交且无页面中断的聊天，才可按WORKER使用20秒无正文、确认停止后的同聊天一次重试。
 
 恢复约定：collect-first的临时连接/页面故障按docs/WORKER.md执行最多3次有限恢复；strict自动重连一次。已知账号或服务全局暂停后，用户明确继续/恢复才进行页面检查，不追加确认。恢复时读取详细租约状态，其他有效租约不得抢占。有限恢复失败时保留准确全局暂停、cleanup并结束，不重发或循环探测。
 

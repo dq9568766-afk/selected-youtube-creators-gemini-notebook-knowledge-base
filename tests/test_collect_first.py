@@ -157,14 +157,72 @@ class CollectFirstTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             ytg.metadata(self.s, run, CID, VID, fetch, force=True)
 
-    def test_timing_and_blocker_precedence(self):
-        self.assertEqual(ytg.generation_decision(119), 'wait')
-        self.assertEqual(ytg.generation_decision(120), 'defer')
-        self.assertEqual(ytg.generation_decision(120, substantive=True, growing=True), 'wait')
-        self.assertEqual(ytg.generation_decision(300, substantive=True, growing=True), 'defer')
-        self.assertEqual(ytg.generation_decision(80, substantive=True, complete=True), 'summary')
+    def test_fast_check_decisions_and_strict_timing(self):
+        self.assertEqual(ytg.generation_decision(19), 'wait')
+        self.assertEqual(ytg.generation_decision(20), 'retry')
+        self.assertEqual(ytg.generation_decision(20, retry_count=1), 'defer')
+        self.assertEqual(ytg.generation_decision(20, substantive=True, growing=True), 'defer')
+        self.assertEqual(ytg.generation_decision(20, substantive=True, complete=True), 'summary')
+        self.assertEqual(ytg.generation_decision(119, policy='strict'), 'wait')
+        self.assertEqual(ytg.generation_decision(120, policy='strict'), 'defer')
+        self.assertEqual(ytg.generation_decision(120, substantive=True, growing=True, policy='strict'), 'wait')
         for blocker in ('captcha', 'login', 'quota', 'network'):
-            self.assertEqual(ytg.generation_decision(300, complete=True, substantive=True, blocker=blocker), 'stop')
+            self.assertEqual(ytg.generation_decision(20, complete=True, substantive=True, blocker=blocker), 'stop')
+
+    def test_fast_retry_once_preserves_chat_and_can_finish(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='search-no-result')
+        item = self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.assertEqual((item['state'], item['retry_count'], item['chat']), ('submitting', 1, CHAT))
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        item = self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        self.s.transition(run, CID, VID, 'renamed', item['expected_title'])
+        self.s.transition(run, CID, VID, 'verify', item['expected_title'], 'current-page-video-summary')
+        self.assertEqual(self.s.report(channel_id=CID)['verified'], 1)
+
+    def test_retry_rejected_for_strict_unknown_or_interrupted_chat(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        self.s.db.execute("UPDATE runs SET policy='strict' WHERE id=?", (run,))
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.s.db.execute("UPDATE runs SET policy='collect-first' WHERE id=?", (run,))
+        self.s.transition(run, CID, VID, 'require-reopen', 'page_interrupted')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+
+    def test_retry_budget_and_crash_do_not_allow_third_submission(self):
+        run = self.begin()
+        self.s.db.execute("UPDATE runs SET mode='incremental' WHERE id=?", (run,))
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.assertEqual(self.s.budget_used(CID), 2)
+        self.s.cleanup(run)
+        run = self.s.begin('incremental', channel_id=CID, policy='collect-first')['id']
+        self.s.reserve(run)
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.assertEqual(self.s.video(CID, VID)['retry_count'], 1)
+
+    def test_retry_budget_exhaustion_preserves_first_attempt(self):
+        run = self.begin()
+        self.s.db.execute("UPDATE runs SET mode='incremental' WHERE id=?", (run,))
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        self.s.db.execute('UPDATE daily_budget SET used=20')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        self.assertEqual(self.s.video(CID, VID)['retry_count'], 0)
+        self.s.transition(run, CID, VID, 'defer', 'generation_timeout')
 
 
 if __name__ == '__main__':

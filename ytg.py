@@ -121,11 +121,16 @@ def metadata_fresh(row):
     checked = row['metadata_checked']
     return checked is not None and bool(row['published']) and (bool(row['history']) or 0 <= time.time()-checked < METADATA_TTL)
 
-def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None):
+def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None,
+                        policy="collect-first", retry_count=0):
     if blocker:
         return 'stop'
     if complete and substantive:
         return 'summary'
+    if policy == 'collect-first':
+        if elapsed < 20:
+            return 'wait'
+        return 'retry' if not substantive and retry_count == 0 else 'defer'
     if elapsed >= 300 or (elapsed >= 120 and not (substantive and growing)):
         return 'defer'
     return 'wait'
@@ -565,6 +570,17 @@ class Store:
                     self.db.execute('INSERT INTO daily_budget VALUES(?,?,1) ON CONFLICT(channel_id,day) DO UPDATE SET used=used+1',(cid,now().date().isoformat()))
                 self.db.execute('UPDATE runs SET armed=armed+1 WHERE id=?',(run,))
                 self.db.execute("UPDATE videos SET state='submitting' WHERE channel_id=? AND id=?",args)
+            elif action=='retry':
+                if (current_run['policy']!='collect-first' or v['state']!='submitted'
+                        or not v['chat'] or v['retry_count']!=0 or v['reopen_required']
+                        or evidence!='20s-no-body-stopped-same-chat'):
+                    raise Stop('Retry requires a confirmed same chat, no body after 20 seconds, stopped generation and no prior retry')
+                if current_run['mode']=='incremental':
+                    if current_run['armed']>=20 or self.budget_used(cid)>=20:
+                        raise Stop('Submission budget exhausted; defer generation_timeout instead')
+                    self.db.execute('INSERT INTO daily_budget VALUES(?,?,1) ON CONFLICT(channel_id,day) DO UPDATE SET used=used+1',(cid,now().date().isoformat()))
+                self.db.execute('UPDATE runs SET armed=armed+1 WHERE id=?',(run,))
+                self.db.execute("UPDATE videos SET state='submitting',retry_count=retry_count+1 WHERE channel_id=? AND id=?",args)
             elif action=='attach':
                 if v['state'] not in {'submitting','uncertain','submitted'}:
                     raise Stop('Attach is only valid after a submission intent or during reconciliation')
@@ -949,7 +965,7 @@ def main(argv=None):
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
-    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','attach','summary','renamed','verify','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
+    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
     a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history'); a.add_argument('--channel')
     a = sub.add_parser('pause'); a.add_argument('reason',choices=sorted(REASONS)); a.add_argument('--channel')
     a = sub.add_parser('resume'); a.add_argument('--confirmed',action='store_true',required=True); a.add_argument('--channel')

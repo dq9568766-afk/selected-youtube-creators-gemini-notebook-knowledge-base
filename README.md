@@ -71,9 +71,10 @@ https://www.youtube.com/@channel
 ### 📌 使用前，知道这几件事
 
 - **需要智能体持续执行。** 电脑关机、应用退出、登录失效或额度耗尽时，不能保证继续处理；暂停不代表后台还在跑。
+- **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文且确认停止后可在同聊天重发一次，再等20秒。未完成则停止并延期，首次已有正文但未完成不重发。重试也占增量提交预算，不同视频仍至少间隔90秒提交。
 - **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少2分钟；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
 - **少留一份数据。** 只采集公开元数据，不下载视频、音频或字幕，不调用 Gemini API；摘要留在 Gemini，本地只记最小任务状态。
-- **总结仍需判断。** 92项隔离自动测试已通过；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
+- **总结仍需判断。** 113项隔离自动测试已通过；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
 
 <details>
 <summary>维护与进阶：依赖、测试、任务数据库</summary>
@@ -150,7 +151,9 @@ Report generated and verified counts, plus every unfinished item.
 
 The agent needs to remain available to execute the workflow. Login, quota, and session blockers can stop progress. Processing uses one working tab, with a break of at least 2 minutes after every 20 settled items.
 
-Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **92 isolated tests pass**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
+In collect-first, check once 20 seconds after each submission. A confirmed, stopped first attempt with no substantive body may be resent once in the same chat, followed by one more 20-second wait. Stop and defer unfinished output; do not resend partial output. Retries count toward the incremental submission budget, and different videos retain a minimum 90-second submission interval. See the worker procedure for recovery exceptions.
+
+Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **113 isolated tests pass**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
 
 ---
 
