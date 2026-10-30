@@ -12,10 +12,10 @@
 
 | 你想要 | 这个项目怎么做 |
 | --- | --- |
-| 一次整理喜欢的博主 | 采集频道的公开视频、Shorts 和直播回放；首次先连续总结保存，再统一改名核验，不设历史条数上限。 |
+| 一次整理喜欢的博主 | 采集频道的公开视频、Shorts 和直播回放；每条总结完成后立即改名核验，再处理下一条，不设历史条数上限。 |
 | 不再手动盯更新 | Windows 本地时间每天 05:00 检查新视频；日常先读最新清单，周一全量核对。每轮所有频道合计最多 20 次新提交。 |
 | 让总结变成能检索的资料 | 一个频道对应一个 Gemini 笔记本，一条视频对应一个独立聊天。总结后命名为 `YYYYMMDD-主题词-完整原视频标题`，重新打开核对保存。 |
-| 视频多也能接着做 | 按频道和视频 ID 去重，新视频优先、频道轮转；历史任务连续处理，已确认的单视频错误会跳过并留入人工核验清单，全部结束后汇报结果。历史处理不受每轮 20 条的总量限制，生成期间不逐条改名。 |
+| 视频多也能接着做 | 按频道和视频 ID 去重，新视频优先、频道轮转；历史任务连续处理，已确认的单视频错误会跳过并留入人工核验清单，全部结束后汇报结果。历史处理不受每轮 20 条的总量限制，每条归档核验完成后才继续。 |
 | 少留一份敏感数据 | 不用 Gemini API，不下载视频、音频、字幕，也不在本地存摘要。SQLite 只保存最小任务状态。 |
 
 适合想持续跟进创作者、把视频内容按频道归档的人。摘要留在 **Gemini 网页笔记本**，这里的“知识库”指可重新打开的笔记本聊天；项目不会替你导出 Obsidian 文件或保证模型总结绝对准确。
@@ -52,7 +52,7 @@ python ytg.py status
 
 发送前记录任务状态。已确认的单视频错误会跳过并列入最终人工核验清单；网页提交结果不确定、额度、登录、验证码或浏览器故障仍会安全暂停，不重复发送或绕过限制。所有历史任务处理完后生成汇总报告。
 
-已完成 **3 条视频的 Gemini 网页端到端验证**，并通过 **52 项自动测试**。历史视频长期连续处理、未来定时触发和多频道生产运行仍需观察；详见 [验证记录](docs/VALIDATION.md)。
+已完成 **3 条视频的 Gemini 网页端到端验证**，并通过 **92 项自动测试**。历史视频长期连续处理、未来定时触发和多频道生产运行仍需观察；详见 [验证记录](docs/VALIDATION.md)。
 
 ### 来源与隐私
 
@@ -64,7 +64,7 @@ python ytg.py status
 
 ### Your favorite creator, organized ✨
 
-Give the tool a YouTube channel URL. It inventories public videos, Shorts, and streams, then generates all available historical summaries before renaming and verifying the chats. Each video gets its own summary chat inside that channel's Gemini Notebook. New uploads are checked every day at 05:00 Windows local time; Monday also verifies the full channel list. A scheduled round permits up to 20 new submissions across all channels.
+Give the tool a YouTube channel URL. It inventories public videos, Shorts, and streams, then summarizes, renames, and verifies each video before moving to the next. Each video gets its own summary chat inside that channel's Gemini Notebook. New uploads are checked every day at 05:00 Windows local time; Monday also verifies the full channel list. A scheduled round permits up to 20 new submissions across all channels.
 
 Chats are named `YYYYMMDD-topic-full original video title` immediately after each summary. Normally verify the exact title, complete summary, original video link, account and Notebook on the current page before processing another video. Operation errors, page interruption, an unchanged title or unclear membership require a persistent flag and verification after reopening the saved chat in the same working tab. Rest at least120 seconds after every20 settled videos; counts survive restarts and history/incremental handoffs. Health cooldown remains separate. Tasks are deduplicated by channel and video ID. Historical processing has no overall submission cap; the incremental cap remains20. Deferred items are included in the final report, and pause scope follows WORKER.
 
@@ -90,7 +90,7 @@ See the [worker procedure](docs/WORKER.md) for web actions, scheduling, and reco
 
 The worker records state before sending. Confirmed per-video failures are skipped for a final manual-review report. Unknown submissions, quota, login, CAPTCHA, and browser-wide failures still cause a safe pause; it does not risk duplicate chats or bypass limits.
 
-**Three videos have passed live Gemini end-to-end checks**, and **52 automated tests pass**. Sustained historical processing, future scheduled triggers, and production use across multiple channels still need observation. See the [validation record](docs/VALIDATION.md).
+**Three videos have passed live Gemini end-to-end checks**, and **92 automated tests pass**. Sustained historical processing, future scheduled triggers, and production use across multiple channels still need observation. See the [validation record](docs/VALIDATION.md).
 
 This project builds on [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome). The [upstream source and MIT license](vendor/youtube-summarizer-chrome/) are retained, with [attribution](NOTICE.md). The production queue uses Codex web automation rather than installing the original extension. Never commit task databases, summaries, logs, screenshots, cookies, tokens, browser data, or private Notebook URLs. Run `python publish_check.py` before publishing.
 
