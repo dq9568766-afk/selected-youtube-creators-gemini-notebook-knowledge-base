@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS videos(
 CREATE INDEX IF NOT EXISTS videos_owner_state ON videos(owner,state,found);
 CREATE INDEX IF NOT EXISTS videos_queue ON videos(history,state,found);
 """
-METADATA_TTL = 3600
+METADATA_TTL = 3600  # Legacy compatibility; complete publication caches no longer expire.
 SCAN_WINDOW = 50
 SCAN_OVERLAP = 10
 REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
@@ -114,12 +114,14 @@ def title_for(row, topic=None):
     topic = topic or row['topic']
     if not topic or not re.fullmatch(r'[\u3400-\u4dbf\u4e00-\u9fff]{1,5}', topic):
         raise Stop('Topic must contain 1–5 Han characters')
-    return f"{date_value(row['published'])}-{topic}-{row['title']}"
+    prefix = f"{date_value(row['published'])}-" if row['published'] else ''
+    return f"{prefix}{topic}-{row['title']}"
 
 
 def metadata_fresh(row):
-    checked = row['metadata_checked']
-    return checked is not None and bool(row['published']) and (bool(row['history']) or 0 <= time.time()-checked < METADATA_TTL)
+    # Date is optional for collection-first history processing. A usable
+    # inventory title is enough to prepare a summary without a detail lookup.
+    return bool(row['title'].strip()) and row['title'] != row['id']
 
 def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None,
                         policy="collect-first", retry_count=0):
@@ -143,6 +145,9 @@ class Store:
         self.db.execute('PRAGMA journal_mode=WAL')
         had_pacing = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacing'").fetchone())
         self.db.executescript(SCHEMA)
+        import backfill
+        self.db.executescript(backfill.SCHEMA)
+        backfill.migrate(self)
         # Older task databases are upgraded in place without resetting task state.
         columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
         if 'metadata_checked' not in columns:
@@ -286,22 +291,23 @@ class Store:
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}',vid or ''):
             raise Stop('Invalid video id in inventory')
         title = entry.get('title') or vid
+        try:
+            published = date_value(entry.get('release_date') or entry.get('upload_date'))
+        except (Stop, TypeError):
+            published = None
         # Keep the title used by an existing chat stable even if YouTube edits it.
         self.db.execute('''INSERT INTO videos(channel_id,id,title,published,history,found,seen)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(channel_id,id) DO UPDATE SET
           seen=excluded.seen,missing=0,
           metadata_checked=CASE WHEN videos.state='pending' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
           title=CASE WHEN videos.state='pending' THEN excluded.title ELSE videos.title END,
+          published=CASE WHEN videos.state='pending' AND excluded.published IS NOT NULL THEN excluded.published ELSE videos.published END,
           processed_counted=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 0 ELSE videos.processed_counted END,
           state=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 'pending' ELSE videos.state END,
           reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN NULL ELSE videos.reason END''',
-          (cid,vid,title,entry.get('upload_date'),int(history),time.time_ns(),stamp))
-        if history and entry.get('upload_date'):
-            try:
-                date_value(entry['upload_date'])
-            except Stop:
-                return
-            self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=? AND published=? AND metadata_checked IS NULL", (time.time(),cid,vid,title,entry['upload_date']))
+          (cid,vid,title,published,int(history),time.time_ns(),stamp))
+        if title.strip() and title != vid:
+            self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
 
 
     def check_lease(self,run):
@@ -489,7 +495,7 @@ class Store:
         d['marker'] = f"YTG:{row['channel_id']}:{row['id']}"
         d['url'] = 'https://www.youtube.com/watch?v='+row['id']
         d['phase'] = 'finalize' if row['state'] in {'summarized','renamed','verified'} else 'generate'
-        if row['topic'] and row['published']:
+        if row['topic']:
             d['expected_title'] = title_for(row)
         if row['state']=='reserved':
             d['prompt'] = d['url'] + '\n总结'
@@ -559,7 +565,7 @@ class Store:
                 params=(v['history'],vid,current_run['channel_id']) if current_run['channel_id'] else (v['history'],vid)
                 if self.db.execute("SELECT 1 FROM videos WHERE history=? AND id<>? AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',params).fetchone():
                     raise Stop('Finish the current video before submitting another')
-                if v['state']!='reserved' or not v['published'] or not metadata_fresh(v):
+                if v['state']!='reserved' or not metadata_fresh(v):
                     raise Stop('Only a reserved item with verified metadata can be armed')
                 r = self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
                 if r['mode']=='incremental' and r['armed']>=20:
@@ -705,7 +711,7 @@ class Store:
                     'leases':[dict(x) for x in self.db.execute('SELECT scope,run_id,expires FROM lease WHERE expires>?',(time.time(),))],
                     'daily_due':self.daily_due(channel_id), 'channel_id':channel_id,
                     'daily_used':self.budget_used(channel_id),
-                    'states':[dict(x) for x in self.db.execute('SELECT history,state,count(*) AS count FROM videos GROUP BY history,state')]}
+                    'states':[dict(x) for x in self.db.execute('SELECT history,state,count(*) AS count FROM videos'+(' WHERE channel_id=?' if channel_id else '')+' GROUP BY history,state',(channel_id,) if channel_id else ())]}
         return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
                 'states':[dict(x) for x in self.db.execute('SELECT state,history,count(*) AS count FROM videos GROUP BY state,history')],
                 'scans':[dict(x) for x in self.db.execute('SELECT * FROM scans')],
@@ -735,7 +741,7 @@ class Store:
                 deferred[row['reason']]=deferred.get(row['reason'],0)+1
                 item={k:row[k] for k in ('channel_id','id','title','reason','chat','missing')}
                 item['url']='https://www.youtube.com/watch?v='+row['id']
-                if row['topic'] and row['published']:
+                if row['topic']:
                     item['expected_title']=title_for(row)
                 review.append(item)
             elif row['state']!='verified':
@@ -745,27 +751,49 @@ class Store:
                 'manual_review':review,'generated':generated,'verified':counts.get('verified',0),
                 'not_generated':total-generated,'success_rate':generated/total if total else 0}
 
+class MetadataFailure(Stop):
+    """Only a safe category is exposed; raw extractor diagnostics stay in memory."""
+
+def metadata_failure(exc):
+    message = str(exc).lower()
+    if message in {'youtube_auth_required','youtube_rate_limited','metadata_network_error','metadata_error'}:
+        return message
+    if any(x in message for x in ('not a bot', 'captcha', '/sorry', 'unusual traffic')):
+        return 'youtube_auth_required'
+    if re.search(r'\b429\b|too many requests', message):
+        return 'youtube_rate_limited'
+    if any(x in message for x in ('timed out', 'timeout', 'connection reset', 'unable to connect', 'name resolution')):
+        return 'metadata_network_error'
+    return 'metadata_error'
+
 class Quiet:
     def debug(self,*a): pass
-    def warning(self,*a): pass
-    def error(self,*a): pass
+    def warning(self,*a):
+        category = metadata_failure(' '.join(map(str,a)))
+        if category in {'youtube_auth_required', 'youtube_rate_limited'}:
+            raise MetadataFailure(category)
+    def error(self,*a): self.warning(*a)
 
 def extract(url,flat=False,limit=None):
     from yt_dlp import YoutubeDL
     opts = {'skip_download':True,'extract_flat':flat,'lazy_playlist':True,
             'quiet':True,'no_warnings':True,'logger':Quiet(),
-            'ignoreerrors':False,'noplaylist':not flat,'retries':2,'extractor_retries':2,
+            'ignoreerrors':False,'noplaylist':not flat,'retries':0,'extractor_retries':0,
             'socket_timeout':30,'cachedir':False,'writesubtitles':False,
             'writeautomaticsub':False,'writethumbnail':False,'writeinfojson':False,
             'playlistend':limit}
-    with YoutubeDL(opts) as ydl:
-        data = ydl.extract_info(url,download=False)
-        if not data:
-            raise Stop('Empty metadata response')
-        if flat:
-            # Consume lazy entries while the extractor context remains alive.
-            return {**data,'entries':list(data.get('entries',[]))}
-        return data
+    try:
+        with YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url,download=False) if flat else ydl.extract_info(url,download=False,process=False)
+            if not data:
+                raise Stop('Empty metadata response')
+            if flat:
+                # Consume lazy entries while the extractor context remains alive.
+                return {**data,'entries':list(data.get('entries',[]))}
+            return data
+    except MetadataFailure:
+        raise
+
 
 def add_channel(s,url):
     url = channel_url(url)
@@ -779,6 +807,10 @@ def add_channel(s,url):
     return dict(s.channel(cid))
 
 def scan(s,cid,full=False,fetch=extract,run=None):
+    import backfill
+    original_fetch=fetch
+    if original_fetch is extract:
+        fetch=lambda url,flat=False,limit=None: backfill.fetch(s,url,flat,limit,original_fetch)
     c = s.channel(cid)
     if s.pause_for(cid):
         raise Stop('Paused: '+s.pause_for(cid))
@@ -842,6 +874,9 @@ def scan(s,cid,full=False,fetch=extract,run=None):
             results.append({'tab':tab,'status':'ok','count':count,
                             'scope':'recent' if windowed else 'full'})
         except Exception as exc:
+            category = metadata_failure(exc)
+            if isinstance(exc, MetadataFailure) or category in {'youtube_auth_required','youtube_rate_limited','metadata_network_error'}:
+                raise MetadataFailure(str(exc) if isinstance(exc, MetadataFailure) else category) from exc
             # Only the extractor's explicit absent-tab result is an empty list.
             # Network, auth, pagination, CAPTCHA, and generic errors remain errors.
             absent = bool(re.search(r'does not have a '+tab+r' tab',str(exc),re.I))
@@ -879,11 +914,17 @@ def metadata(s,run,cid,vid,fetch=extract,force=False):
         if not force and metadata_fresh(v):
             return s.payload(v)
     try:
-        info = fetch('https://www.youtube.com/watch?v='+vid,False)
+        import backfill
+        info = backfill.fetch(s,'https://www.youtube.com/watch?v='+vid,extractor=fetch) if fetch is extract else fetch('https://www.youtube.com/watch?v='+vid,False)
     except Exception as exc:
+        category = metadata_failure(exc)
+        if isinstance(exc, MetadataFailure):
+            raise
+        if category != 'metadata_error':
+            raise MetadataFailure(category) from exc
         if any(text in str(exc).lower() for text in ('members-only','private video','video unavailable','video has been removed','video is unavailable')):
             return s.transition(run,cid,vid,'defer','metadata_unavailable')
-        raise
+        raise MetadataFailure(category) from exc
     if info.get('id')!=vid or info.get('channel_id')!=cid:
         raise Stop('Video/channel identity mismatch')
     if info.get('live_status') in {'is_live','is_upcoming','post_live'}:
@@ -891,7 +932,7 @@ def metadata(s,run,cid,vid,fetch=extract,force=False):
     try:
         date = date_value(info.get('release_date') or info.get('upload_date'))
     except Stop:
-        return s.transition(run,cid,vid,'defer','metadata_unavailable')
+        date = None
     if not isinstance(info.get('title'),str) or not info['title'].strip():
         raise Stop('Metadata did not return an original title')
     with s.tx():
@@ -957,6 +998,7 @@ def main(argv=None):
     p.add_argument('--verbose',action='store_true',help='Return full records for troubleshooting')
     sub = p.add_subparsers(dest='cmd',required=True)
     a = sub.add_parser('status'); a.add_argument('--channel')
+    a = sub.add_parser('metadata-backfill'); a.add_argument('operation',choices=['start','run','status','report','resume']); a.add_argument('job',nargs='?'); a.add_argument('--channel'); a.add_argument('--confirmed',action='store_true')
     a = sub.add_parser('add'); a.add_argument('url')
     a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
@@ -977,6 +1019,21 @@ def main(argv=None):
             raise Stop('Task database is missing; refusing to create an empty replacement')
         s = Store(args.db)
         if args.cmd=='status': result=s.status(verbose=args.verbose,channel_id=args.channel)
+        elif args.cmd=='metadata-backfill':
+            import backfill
+            if args.operation=='start':
+                if not args.channel: raise Stop('--channel is required')
+                result=backfill.start(s,args.channel)
+            elif args.operation=='resume':
+                if not args.confirmed: raise Stop('Explicit recovery confirmation required')
+                with s.tx():
+                    s.db.execute('UPDATE metadata_access SET blocked=NULL WHERE id=1')
+                    if args.job:
+                        s.db.execute("UPDATE metadata_jobs SET status='ready' WHERE id=? AND status='review'",(args.job,))
+                result={'metadata_resumed':True,'job':args.job}
+            else:
+                if not args.job: raise Stop('Job ID is required')
+                result=backfill.step(s,args.job) if args.operation=='run' else backfill.report(s,args.job)
         elif args.cmd=='report': result=s.report(args.mode,args.channel)
         elif args.cmd=='add': result=add_channel(s,args.url)
         elif args.cmd=='notebook':
@@ -1042,5 +1099,7 @@ def main(argv=None):
             s.db.close()
 
 if __name__=='__main__':
+    # Helpers must share these exact exception classes with the CLI entrypoint.
+    sys.modules.setdefault('ytg',sys.modules[__name__])
     sys.stdout.reconfigure(encoding='utf-8')
     sys.exit(main())

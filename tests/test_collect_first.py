@@ -154,7 +154,7 @@ class CollectFirstTests(unittest.TestCase):
         def fetch(*args):
             raise AssertionError('Unexpected metadata request')
         self.assertEqual(ytg.prepare(self.s, run, fetch)['state'], 'reserved')
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(ytg.MetadataFailure, 'metadata_error'):
             ytg.metadata(self.s, run, CID, VID, fetch, force=True)
 
     def test_fast_check_decisions_and_strict_timing(self):

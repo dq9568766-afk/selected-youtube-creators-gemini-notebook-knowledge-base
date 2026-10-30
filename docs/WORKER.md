@@ -27,7 +27,7 @@
 
 ## 首轮 collect-first
 
-1. `prepare RUN`：复用完整历史扫描标题、真实日期与已核实频道；历史缓存不因一小时过去而失效。仅缺失、无效、扫描标题变更使缓存失效或用户要求 `metadata ... --force` 时查单条。会员、删除、私密、缺公开日期等记 metadata_unavailable；即将直播记 live_not_ready。明确单条来源限制不计服务失败。
+1. `prepare RUN`：历史和增量长期复用已核实的视频/频道和原标题。发布日期是可选归档字段；有日期时标题为`日期-主题词-原标题`，缺日期时标题为`主题词-原标题`，不因缺日期查询YouTube。只有标题或频道/视频身份缺失时才查询当前reserved单条；不批量补日期、不从Gemini输出推算日期。明确会员、删除、私密等限制仍按metadata_unavailable处理；即将直播记live_not_ready。
 2. 新视频不搜索、不查历史。已登记 chat 直接打开一次；无法确定链接、内容或 Notebook 归属，记 chat_unidentified。若是页面读取/连接问题，先按下方有限恢复处理。
 3. 核对空白入口及原视频链接，`step RUN CHANNEL VIDEO arm` 后才发送一次消息，内容为视频 URL 换行加“总结”。原消息出现且 URL 稳定后读取一次并 `attach --value CHAT_URL --evidence video-match`；仅地址不稳定、导航变化或身份不明时复查。地址读取用当前浏览器提供的标签信息；不要为了找地址创建公开分享链接。
 4. collect-first 每次提交后等待20秒，只检查一次；页面操作耗时计入等待。一次读取合并核对生成状态、实质正文、原视频链接、账号和Notebook归属。证据齐全且生成完成立即执行 `summary --value 主题词 --evidence youtube-content-complete --next`；主题词1–5汉字。首次检查已有正文但仍未完成，停止并确认后记 generation_timeout，不重发，不延长等待。
@@ -45,6 +45,10 @@
 - pacing 中的计数与休息起点按频道持久化，runs 的 batch_count/batch_started 回显当前进度；历史/增量切换、新轮次、重启不重置。兼容无频道旧运行使用独立范围。升级保留旧聊天与已计数记录，遗留聊天须重开核验且不重复计数；旧计数不可靠时先设一次120秒休息，期间可以核验已有聊天。健康冷却的300秒独立保留，不改成120秒。
 
 ## 服务故障与有限恢复
+
+- 元数据请求遵守缓存优先，关闭提取器内部重试。yt-dlp警告也要识别：youtube_rate_limited表示HTTP 429，youtube_auth_required表示机器人确认/认证挑战，metadata_network_error表示连接失败，metadata_error表示原因未确定。只输出安全分类，不保存原始异常日志。首次发现限流/挑战就停止本次提取或后续tab扫描；不得换ID、强制查询或额外诊断请求来验证服务健康。
+- 上述服务错误保留reserved及原进度，不计单条延期、不计处理完成；停止时cleanup释放预约回pending，不修改chat或发送证据。429按现有network暂停，明确认证挑战按captcha暂停；原因未明则保留状态并检查本地实现，不能人工defer为metadata_unavailable。现阶段不新增共享限速、持久化冷却或自动唤醒；现有暂停及用户明确恢复边界保持。不得仅凭yt-dlp异常断言Gemini账号失效。
+- 已有扫描继续复用成功tab；不为补某条日期重复全量扫描。当前无页级断点协议，不能声称支持分页续传。扫描失败保持不完整，不标未读条目source_missing。此前误延期项仅凭可核验证据复核，不因本次升级自动重新入队或改写真实任务库。
 
 - 单条 uncertain 在 collect-first 不设置暂停；立即按证据延期。strict 的 unknown_submit、连续来源失败和健康探测失败写入当前频道的暂停，不阻断其他频道；真实账号或服务故障写入全局暂停，优先于单条延期；不得因延期掩盖全局故障。
 - 网络、标签失效、读取失败最多恢复3次，分别等待15、45、120秒；等待用不超过60秒分段。沿用同一获准浏览器，旧标签失效按 docs/AGENT_ADAPTERS.md 使用新工作标签。每次检查可读页面及一次无副作用交互，恢复成功才继续；失败后 pause network/ui_changed 并 cleanup。出现登录、验证码、/sorry、异常流量、配额立即中止恢复。
@@ -82,3 +86,16 @@ manual_review包括所有延期项，列ID、原标题、原因、原视频链�
 全量成功清单中缺失的pending登记为source_missing延期并纳入复核；遗留missing/pending仍算未完成，不能从完成率分母中隐藏。来源重新出现后保留延期，按用户选择补做。
 
 保持同线程单个Goal，不创建历史heartbeat。正常处理中只汇总批次进度；每个单条失败无需通知或提问。实际全局阻塞及时通知一次；状态无变化保持安静。CLI不是后台worker，不在结束后声称仍运行。
+
+
+## 历史日期补齐（可选）
+
+日期补齐不是总结前置条件。除非用户单独要求，不启动或恢复 `metadata-backfill`；王志安当前任务明确跳过历史日期补齐，已有标题和视频身份即可继续总结。
+
+单独要求日期资料时才运行 `metadata-backfill`；它不发送 Gemini，也不自动重新入队延期总结。
+
+元数据请求共享数据库节流：提取开始至少间隔10秒，每50次至少休息300秒，跨进程和重启保留；短分段等待。429、认证挑战及连接故障写入独立 YouTube metadata_access.blocked，立即停止，不轮换客户端、不换ID探测。此暂停不表示Gemini登录失效。用户明确恢复后使用 metadata-backfill resume --confirmed 清除元数据服务暂停；不清除其他范围暂停，不自动唤醒。普通扫描和单条查询也遵守此访问门槛。
+
+补齐状态与总结状态分离：pending/fetching/complete/unavailable/review；每条事务保存，失败保留待处理。明确限制或确实没有公开日期记unavailable，未知异常或身份冲突停止复核。保留release_date、upload_date、采用来源和检查时间，不推算日期。补齐不发送Gemini、不重新入队延期总结，不改已有聊天名称。频道租约互斥，退出释放本轮占用。
+
+报告区分补齐首轮结束与全部日期齐全：complete表示无pending/fetching/review；all_dates_complete及date_coverage说明实际覆盖率。不可用项目不算日期成功。此专用模式实现共享节流与持久暂停，取代旧文档中“暂未实现共享限速”的描述；普通总结流程仍不批量预取。
