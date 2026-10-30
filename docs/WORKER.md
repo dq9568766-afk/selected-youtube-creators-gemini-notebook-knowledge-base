@@ -29,7 +29,7 @@
 4. 提交后以约30、60、120秒作为检查点，不要求等待满120秒；页面操作耗时计入间隔。每次读取合并核对生成状态、实质正文、原视频链接和Notebook归属。证据齐全且生成完成立即执行 `summary --value 主题词 --evidence youtube-content-complete --next`；主题词1–5汉字。120秒无实质正文记 generation_timeout；实质正文持续增长可延长至提交后300秒。
 5. 提交是否发生无法确认记 submission_unconfirmed；地址或聊天身份不明记 chat_unidentified；内容不匹配、拒答或仅复述标题记 content_failed。执行 `defer --value REASON --next` 后继续。首轮每条最多提交一次，不搜索、不 retry，也不因延期自动再入队。
 6. 超时仍有停止按钮时点击一次并核对已停止，再进入下一条。无法停止、无法读回或无法建立独立空白入口，进入有限浏览器恢复；失败则全局停止，不能继续并行提交。
-7. 每条总结完成后立即改名并核验，才处理下一条。`summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`。`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。
+7. 每条总结完成后立即改名并核验，核验成功或明确延期后立即处理下一条；用户未明确要求单条暂停时不得在这里结束 Goal 或调用 `cleanup`。`summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`，再用 `verify ... --next` 推进。`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。
 
 ## 共用改名、核验与休息
 
@@ -58,7 +58,7 @@ strict 的 unknown_submit 按当前频道暂停；已登记聊天优先恢复。
 
 每天05:00（Asia/Shanghai）增量使用 `begin --mode incremental --scheduled --channel CHANNEL_ID`，scan --run RUN 后 prepare；仅 history=0，每日最多20次提交。周一全量，其他日近期窗口无重叠才回退全量。扫描 incomplete 是未完成，须查明原因。历史 prepare/--next 返回 daily_due 时，在安全边界 park，运行同频道增量并 end，再以原 policy 开始历史；正在生成先结清或按策略延期，不中途切换。
 
-完成轮次用 end，切换增量用 park。暂停或暂时结束但仍有已生成积压时，用 `cleanup RUN` 释放本运行lease与reserved，保留未确认提交及暂停原因，其他频道状态不动。cleanup 不代表任务完成或服务恢复；再次开始会恢复已有任务。`status` 的 `pause` 字段表示全局暂停，`pauses` 字段列出各范围暂停；开始频道范围运行时只检查该频道及全局暂停。频道暂停使用 `pause REASON --channel CHANNEL_ID`，经授权恢复使用 `resume --confirmed --channel CHANNEL_ID`；全局暂停恢复仅使用不带频道的 `resume --confirmed`，不会清除频道暂停。
+完成轮次用 end，切换增量用 park。连续处理时保持当前运行租约，不要因单条成功调用 `cleanup`；只有完成、用户明确停止、暂停、规定冷却或需要交接时才清理。暂停或暂时结束但仍有已生成积压时，用 `cleanup RUN` 释放本运行lease与reserved，保留未确认提交及暂停原因，其他频道状态不动。cleanup 不代表任务完成或服务恢复；再次开始会恢复已有任务。`status` 的 `pause` 字段表示全局暂停，`pauses` 字段列出各范围暂停；开始频道范围运行时只检查该频道及全局暂停。频道暂停使用 `pause REASON --channel CHANNEL_ID`，经授权恢复使用 `resume --confirmed --channel CHANNEL_ID`；全局暂停恢复仅使用不带频道的 `resume --confirmed`，不会清除频道暂停。
 
 ## 报告与通知
 
