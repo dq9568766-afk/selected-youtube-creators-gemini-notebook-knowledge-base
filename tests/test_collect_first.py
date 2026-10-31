@@ -18,6 +18,8 @@ class CollectFirstTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.s = ytg.Store(Path(self.tmp.name) / 'tasks.sqlite3')
+        self.browser_gate=patch.object(self.s,'_claim_submit_slot',return_value=0)
+        self.browser_gate.start()
         self.clock = patch('ytg.now', return_value=datetime(2026, 10, 27, 4, 0))
         self.clock.start()
         for cid, book in [(CID, BOOK), (OTHER, BOOK.replace('1', '2'))]:
@@ -26,6 +28,7 @@ class CollectFirstTests(unittest.TestCase):
         self.add(VID)
 
     def tearDown(self):
+        self.browser_gate.stop()
         self.clock.stop()
         self.s.db.close()
         self.tmp.cleanup()
@@ -198,6 +201,37 @@ class CollectFirstTests(unittest.TestCase):
         self.s.transition(run, CID, VID, 'require-reopen', 'page_interrupted')
         with self.assertRaises(ytg.Stop):
             self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+
+    def test_retry_without_chat_address_requires_current_page_evidence(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
+        item = self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-current-page')
+        self.assertEqual((item['state'], item['retry_count'], item['chat']), ('submitting', 1, None))
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-current-page')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+
+    def test_addressless_retry_interruption_and_missing_address(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-current-page')
+        self.s.cleanup(run)
+        self.assertEqual(self.s.video(CID, VID)['state'], 'uncertain')
+        self.assertEqual(self.s.video(CID, VID)['retry_count'], 1)
+
+    def test_addressless_retry_can_defer_without_success(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-current-page')
+        self.s.transition(run, CID, VID, 'defer', 'chat_unidentified')
+        report = self.s.report(channel_id=CID)
+        self.assertEqual(report['verified'], 0)
+        self.assertEqual(report['manual_review'][0]['reason'], 'chat_unidentified')
 
     def test_retry_budget_and_crash_do_not_allow_third_submission(self):
         run = self.begin()

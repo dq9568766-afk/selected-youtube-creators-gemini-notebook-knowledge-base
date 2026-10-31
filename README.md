@@ -22,7 +22,7 @@
 
 ### ✨ 值得装它的 5 个理由
 
-- **旧视频，按清单慢慢补齐。** 覆盖公开视频、Shorts 和直播清单，按视频 ID 去重，历史处理不设总条数上限。
+- **旧视频，按清单慢慢补齐。** 扫描公开视频和直播清单，按视频 ID 去重；Shorts 单独排除，历史处理不设总条数上限。
 - **总结完就整理好。** 每条生成后立即改名、核验，再处理下一条。标题统一为 `YYYYMMDD-主题词-完整原视频标题`，回头找内容更方便。
 - **中断了，留着进度接着做。** 记录任务状态和已有聊天，恢复时优先接续；提交不明时按规则保留现场，避免重复发送。
 - **哪条没做成，清清楚楚。** 授权失败后置后，首轮把单条异常列入待复查清单，继续后面的内容；生成数、核验数、延期项分开汇报。
@@ -71,10 +71,11 @@ https://www.youtube.com/@channel
 ### 📌 使用前，知道这几件事
 
 - **需要智能体持续执行。** 电脑关机、应用退出、登录失效或额度耗尽时，不能保证继续处理；暂停不代表后台还在跑。
-- **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文且确认停止后可在同聊天重发一次，再等20秒。未完成则停止并延期，首次已有正文但未完成不重发。重试也占增量提交预算，不同视频仍至少间隔90秒提交。
+- **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文、确认停止且页面未跳转或中断后可在当前输入框重发一次，重试前不要求聊天地址，再等20秒。未完成则停止并延期，首次已有正文但未完成不重发。重试也占增量提交预算；不同视频和其他 Gemini 页面动作间隔至少15秒。
 - **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少2分钟；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
+- **页面操作节流。** Gemini 页面动作与不同视频提交至少间隔15秒。非提交动作由 `python ytg.py pace access --run RUN` 领取账号时间槽；协调权只覆盖当前页面动作窗口，其他频道可以并行等待 Gemini 生成；`arm` 和 `retry` 自动检查提交间隔。
 - **少留一份数据。** 只采集公开元数据，不下载视频、音频或字幕，不调用 Gemini API；摘要留在 Gemini，本地只记最小任务状态。
-- **总结仍需判断。** 113项隔离自动测试已通过；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
+- **总结仍需判断。** 隔离自动测试覆盖队列规则；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
 
 <details>
 <summary>维护与进阶：依赖、测试、任务数据库</summary>
@@ -107,7 +108,7 @@ Catching up with a creator means more than watching. There are links to copy, su
 
 ### ✨ Why use it?
 
-- **Work through the archive.** Public videos, Shorts, and streams are deduplicated by video ID. Historical processing has no overall item cap.
+- **Work through the archive.** Public videos and streams are deduplicated by video ID; Shorts are excluded from the inventory. Historical processing has no overall item cap.
 - **Keep notes organized as you go.** Each summary is renamed and verified before the next video. Titles follow `YYYYMMDD-topic-full original title`.
 - **Resume with your progress intact.** Saved task state and chat links help the agent recover existing work and avoid duplicate submissions.
 - **See what actually finished.** With an authorized collect-first run, individual failures are deferred for review. Generated, verified, and deferred counts stay separate.
@@ -151,10 +152,73 @@ Report generated and verified counts, plus every unfinished item.
 
 The agent needs to remain available to execute the workflow. Login, quota, and session blockers can stop progress. Processing uses one working tab, with a break of at least 2 minutes after every 20 settled items.
 
-In collect-first, check once 20 seconds after each submission. A confirmed, stopped first attempt with no substantive body may be resent once in the same chat, followed by one more 20-second wait. Stop and defer unfinished output; do not resend partial output. Retries count toward the incremental submission budget, and different videos retain a minimum 90-second submission interval. See the worker procedure for recovery exceptions.
+In collect-first, check once 20 seconds after each submission. A confirmed, stopped first attempt with no substantive body may be resent once in the current input without a chat URL, provided the page has not navigated or been interrupted, followed by one more 20-second wait. Stop and defer unfinished output; do not resend partial output. Retries count toward the incremental submission budget. Different videos and other Gemini UI actions have a minimum 15-second interval. See the worker procedure for recovery exceptions.
 
-Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **113 isolated tests pass**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
+Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **Isolated tests cover the queue rules**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
 
 ---
 
 参考 / Inspired by [soumikdr/youtube-summarizer-chrome](https://github.com/soumikdr/youtube-summarizer-chrome)。保留 [上游源码与 MIT 许可 / upstream source and MIT license](vendor/youtube-summarizer-chrome/) · [来源说明 / Attribution](NOTICE.md)。
+
+## 常见答疑
+
+### 为什么第一次历史扫描用 yt-dlp，不全部用 YouTube Data API？
+
+两者负责的事情不同：
+
+- **yt-dlp 负责频道清单发现。** 它可以读取频道公开的 `videos` 和 `streams` 页面，按视频 ID 收集标题、公开日期等库存字段，并明确跳过 `shorts`。这更接近项目实际要处理的频道页面范围。
+- **YouTube Data API 负责可选的日期核验。** API 适合用 `videos.list(part=snippet,id=...)` 对本地已有视频 ID 补充或核对 `publishedAt`，但它不直接提供与频道页面完全相同的 `videos / streams / shorts` 标签划分。仅用 API 不能可靠保证项目的 Shorts 排除规则和页面范围规则。
+- **API 也不是无条件可用。** 需要用户自行配置本机 API Key，受配额、429、认证和网络限制影响；批量历史库存不应因为补日期而重复请求。API 返回的 `publishedAt` 是公开视频时间，未必等于原始上传时间。
+
+因此，默认流程是 yt-dlp 首次建立库存，后续优先复用本地已核验元数据；只有用户单独要求日期资料时，才运行 `metadata-backfill`。日期缺失时延期，不猜日期。
+
+### 为什么不下载视频、音频或字幕？
+
+项目只需要公开元数据和 Gemini 网页可读取的视频链接。下载媒体或字幕会扩大存储、版权、隐私和失败处理范围，也不是当前队列完成总结所必需的步骤。
+
+### 为什么不用 Gemini API，而使用已登录的 Gemini 网页？
+
+当前流程依赖 Gemini Notebooks、账号、聊天和网页中的 Notebook 归属核验。项目没有把 Gemini API、私有 RPC、Cookie、Token 或浏览器配置文件作为替代入口。
+
+### 为什么一个视频对应一个聊天？
+
+这样才能把原视频链接、总结、标题、账号和 Notebook 归属逐条核对，避免多个视频混在同一聊天中，也便于失败后恢复原聊天而不是重复创建。
+
+### 为什么使用单工作标签、串行处理？
+
+队列需要确认上一条是否真的提交、是否生成正文、聊天地址是否稳定以及标题是否改名成功。账号协调权只锁定短时页面动作；一个频道等待 Gemini 生成时，其他频道可以并行运行，但提交、读取和归档动作仍按账号统一排队。Gemini 页面动作和不同视频提交也有最小间隔，每处理20条还要休息至少2分钟。
+
+### 每日增量和历史任务谁优先？
+
+每日增量优先。当前历史视频结清后，如果频道的 `daily_due` 已到期，就切换到每日增量；每日轮次结束后再回到历史队列。只对 `tracking=1` 的频道判断每日到期。增量任务与历史任务共用账号级 Gemini 页面时间槽和多频道协调；扫描阶段使用独立的 YouTube 元数据节流，不占用 Gemini 时间槽。
+
+### 遇到限流、配额或验证码怎么办？
+
+使用对应的暂停命令：
+
+```powershell
+python ytg.py pause quota
+python ytg.py pause captcha
+```
+
+暂停时会在本机数据库记录所有当时活动的频道、运行和视频发送上下文；每次提交和重试也记录时间、频道、视频、尝试类型及未结清提交数（它不代表实际同时生成数）。登记暂停时可标注可见的限流类别和页面显示的重置时间，例如 `python ytg.py pause quota --limit-type usage_exhausted --reset-at 2026-10-31T18:00:00+08:00`。无法确定的类别或时间留空，不要推测。提交/重试入口会再次检查全局和频道暂停。不会记录输入正文、摘要、字幕、页面文本、Cookie 或 Token。之后可用以下命令生成分析报告：
+
+```powershell
+python ytg.py gemini-limit-report
+```
+
+### 本地数据库会不会上传到 GitHub？
+
+不会。任务数据库默认位于 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`，不在项目目录中。项目的 Git 忽略规则和发布检查都会拦截 SQLite、日志、凭据和浏览器资料。
+
+### 为什么失败后不自动无限重试？
+
+提交是否发生、聊天身份是否明确、正文是否完整，这些状态不能靠猜测恢复。collect-first 只允许符合证据条件的同聊天快速重试一次；其他未知提交、内容失败、无法核验或元数据缺失会延期，等待用户后续明确处理。
+
+### 什么才算成功？
+
+必须完成总结、立即改名，并核对完整总结、原视频链接、准确标题、Google 账号和登记 Notebook。只有验证成功的条目才计入 verified；延期、未知提交和归档未核验都不算成功。
+
+### 安装技能后会自动在后台运行吗？
+
+不会。`ytg.py` 是队列工具，不是常驻后台服务。每日任务需要外部自动化或用户启动；本地数据库中的暂停或租约也不代表仍有进程在运行。

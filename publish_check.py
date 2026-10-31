@@ -6,7 +6,7 @@ import sys
 
 ROOT=Path(__file__).resolve().parent
 TOP={'.gitignore','.githooks/pre-push','LICENSE','NOTICE.md','README.md','AGENTS.md','SKILL.md','agents/openai.yaml','pyproject.toml',
-     'ytg.py','publish_check.py',
+     'ytg.py','backfill.py','publish_check.py',
      '.agents/skills/youtube-creator-gemini-notebook-knowledge-base/SKILL.md',
      '.agents/skills/youtube-creator-gemini-notebook-knowledge-base/agents/openai.yaml'}
 PREFIX=('tests/','docs/','vendor/youtube-summarizer-chrome/','.github/workflows/')

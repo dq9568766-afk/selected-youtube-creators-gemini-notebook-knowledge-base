@@ -52,15 +52,131 @@ class EfficiencyTests(unittest.TestCase):
         self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
         return run
 
-    def test_prepare_reuses_valid_metadata_and_never_resubmits(self):
+    def test_prepare_reuses_complete_inventory_metadata_and_never_resubmits(self):
         self.video()
         run = self.s.begin('history')['id']
         for _ in range(3):
             self.assertEqual(ytg.prepare(self.s,run,self.fetch)['state'],'reserved')
-        self.assertEqual(self.fetches,1)
+        self.assertEqual(self.fetches,0)
         self.s.transition(run,CID,VID,'arm')
         self.assertEqual(ytg.prepare(self.s,run,self.fetch)['state'],'submitting')
-        self.assertEqual(self.fetches,1)
+        self.assertEqual(self.fetches,0)
+        self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
+
+    def test_gemini_quota_pause_records_submission_context_and_report(self):
+        self.video()
+        run = self.s.begin('history', channel_id=CID)['id']
+        item = ytg.prepare(self.s, run, self.fetch)
+        self.s.transition(run, CID, item['id'], 'arm')
+        self.s.set_pause('quota')
+        event = self.s.db.execute('SELECT * FROM gemini_limit_events').fetchone()
+        self.assertEqual(event['reason'], 'quota')
+        self.assertEqual(event['channel_id'], CID)
+        self.assertEqual(event['run_id'], run)
+        self.assertEqual(event['video_id'], VID)
+        self.assertEqual(event['video_state'], 'submitting')
+        self.assertEqual(event['run_mode'], 'history')
+        self.assertEqual(event['armed'], 1)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM gemini_limit_event_items WHERE event_id=?', (event['id'],)).fetchone()[0], 1)
+        report = self.s.gemini_limit_report()
+        self.assertEqual(report['total_events'], 1)
+        self.assertEqual(report['by_reason'], [{'reason': 'quota', 'count': 1}])
+        self.assertEqual(report['context']['active_submission_events'], 1)
+
+    def test_paused_run_cannot_arm_or_retry(self):
+        self.video()
+        run=self.s.begin('history',channel_id=CID,policy='collect-first')['id']
+        ytg.prepare(self.s,run,self.fetch)
+        self.s.set_pause('quota',observed_type='usage_exhausted')
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run,CID,VID,'arm')
+        self.assertEqual(self.s.video(CID,VID)['state'],'reserved')
+
+    def test_submission_events_record_attempts_and_unresolved_count(self):
+        self.video()
+        run=self.s.begin('history',channel_id=CID)['id']
+        ytg.prepare(self.s,run,self.fetch)
+        self.s.transition(run,CID,VID,'arm')
+        report=self.s.gemini_limit_report()
+        self.assertEqual(report['submission_history']['attempts'],1)
+        self.assertEqual(report['submission_history']['channels'],1)
+        self.assertEqual(report['recent_submissions'][0]['video_id'],VID)
+        self.assertEqual(report['recent_submissions'][0]['unresolved_submissions'],1)
+
+    def test_gemini_quota_pause_records_all_active_channels(self):
+        self.video()
+        run = self.s.begin('history', channel_id=CID)['id']
+        item = ytg.prepare(self.s, run, self.fetch)
+        self.s.transition(run, CID, item['id'], 'arm')
+        self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
+                          (OTHER, 'https://www.youtube.com/channel/' + OTHER, '其他频道', BOOK.replace('1', '2')))
+        self.s.insert(OTHER, {'id': OTHER.replace('UC', 'v')[:11], 'title': '其他视频', 'upload_date': '20261026'}, 'scan', True)
+        other_video = self.s.db.execute('SELECT id FROM videos WHERE channel_id=?', (OTHER,)).fetchone()[0]
+        self.s.db.execute("UPDATE videos SET state='submitting',owner=? WHERE channel_id=? AND id=?", (run, OTHER, other_video))
+        self.s.set_pause('quota')
+        event_id = self.s.db.execute('SELECT id FROM gemini_limit_events').fetchone()[0]
+        rows = self.s.db.execute('SELECT channel_id,video_id FROM gemini_limit_event_items WHERE event_id=? ORDER BY channel_id', (event_id,)).fetchall()
+        self.assertEqual([(row['channel_id'], row['video_id']) for row in rows], [(CID, VID), (OTHER, other_video)])
+        self.assertEqual(self.s.gemini_limit_report()['context']['active_submission_events'], 2)
+
+    def test_gemini_limit_report_can_filter_channel(self):
+        self.s.set_pause('quota')
+        self.s.db.execute('DELETE FROM pauses')
+        self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
+                          (OTHER, 'https://www.youtube.com/channel/' + OTHER, '其他频道', BOOK.replace('1', '2')))
+        self.s.set_pause('quota')
+        report = self.s.gemini_limit_report(CID)
+        self.assertEqual(report['total_events'], 2)
+
+    def test_browser_access_gate_is_shared_and_persistent(self):
+        other=ytg.Store(self.path)
+        try:
+            self.assertEqual(self.s.browser_access('access',at=1000),{'ready':True,'kind':'access'})
+            self.assertEqual(other.browser_access('access',at=1005),
+                             {'ready':False,'seconds_remaining':10,'kind':'access'})
+            self.assertEqual(other.browser_access('access',at=1015),{'ready':True,'kind':'access'})
+        finally:
+            other.db.close()
+
+    def test_account_coordinator_serializes_named_workers(self):
+        self.assertEqual(self.s.browser_access('access', at=1000, owner='run-a'),
+                         {'ready':True,'kind':'access'})
+        blocked = self.s.browser_access('access', at=1001, owner='run-b')
+        self.assertFalse(blocked['ready'])
+        self.assertGreaterEqual(blocked['seconds_remaining'], 14)
+        self.assertEqual(self.s.browser_access('access', at=1015, owner='run-b'),
+                         {'ready':True,'kind':'access'})
+        coordinator = self.s.coordinator_status(at=1015)
+        self.assertEqual(coordinator['owner'], 'run-b')
+        self.assertTrue(coordinator['active'])
+
+    def test_submission_coordinator_expires_while_generation_continues(self):
+        self.video()
+        run = self.s.begin('history', channel_id=CID)['id']
+        item = ytg.prepare(self.s, run, self.fetch)
+        self.s.transition(run, CID, item['id'], 'arm')
+        coordinator = self.s.coordinator_status()
+        self.assertEqual(coordinator['owner'], run)
+        self.assertGreaterEqual(coordinator['seconds_remaining'], 14)
+        self.assertFalse(self.s.coordinator_status(at=time.time()+16)['active'])
+
+    def test_recovery_gate_uses_longer_access_interval(self):
+        self.s.db.execute("INSERT INTO browser_pacing(scope,last_access,last_submit,recovery_remaining) VALUES('gemini-account',1000,1000,3)")
+        self.assertEqual(self.s.browser_access('access',at=1015),
+                         {'ready':False,'seconds_remaining':15,'kind':'access'})
+        self.assertEqual(self.s.browser_access('access',at=1030),{'ready':True,'kind':'access'})
+
+    def test_submission_interval_gate_leaves_retry_state_unchanged(self):
+        self.video()
+        run=self.s.begin('history',channel_id=CID,policy='collect-first')['id']
+        ytg.prepare(self.s,run,self.fetch)
+        self.s.transition(run,CID,VID,'arm')
+        self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
+        base=self.s.db.execute("SELECT last_submit FROM browser_pacing WHERE scope='gemini-account'").fetchone()[0]
+        with patch('ytg.time.time',return_value=base+1):
+            result=self.s.transition(run,CID,VID,'retry',evidence='20s-no-body-stopped-same-chat')
+        self.assertEqual(result,{'ready':False,'seconds_remaining':14,'kind':'submit'})
+        self.assertEqual((self.s.video(CID,VID)['state'],self.s.video(CID,VID)['retry_count']),('submitted',0))
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
     def test_parallel_is_rejected_even_after_chat_attachment(self):
@@ -71,12 +187,12 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.s.reserve(run)['state'],'submitted')
         self.assertEqual(self.s.video(CID,OTHER)['state'],'pending')
 
-    def test_flat_inventory_date_does_not_allow_arm(self):
+    def test_complete_flat_inventory_metadata_allows_arm(self):
         self.video()
         run = self.s.begin('history')['id']
         self.s.reserve(run)
-        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'arm')
-        self.assertEqual(self.s.video(CID,VID)['state'],'reserved')
+        result=self.s.transition(run,CID,VID,'arm')
+        self.assertEqual(result['state'],'submitting')
 
     def test_complete_history_metadata_survives_ttl(self):
         self.video()
@@ -84,7 +200,7 @@ class EfficiencyTests(unittest.TestCase):
         ytg.prepare(self.s,run,self.fetch)
         self.s.db.execute('UPDATE videos SET metadata_checked=?',(time.time()-ytg.METADATA_TTL-1,))
         ytg.prepare(self.s,run,self.fetch)
-        self.assertEqual(self.fetches,1)
+        self.assertEqual(self.fetches,0)
         self.s.transition(run,CID,VID,'arm')
 
     def test_live_deferral_clears_previous_metadata_cache(self):
@@ -103,11 +219,12 @@ class EfficiencyTests(unittest.TestCase):
         ytg.prepare(self.s,run,self.fetch)
         self.s.park(run)
         self.s.insert(CID,{'id':VID,'title':'修改后的标题'},'later',True)
-        self.assertIsNone(self.s.video(CID,VID)['metadata_checked'])
+        self.assertIsNotNone(self.s.video(CID,VID)['metadata_checked'])
 
     def test_advance_commits_verification_when_next_lookup_fails(self):
         run=self.submitted()
         self.video(OTHER)
+        self.s.db.execute('UPDATE videos SET title=?,metadata_checked=NULL WHERE id=?',(OTHER,OTHER))
         self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
         title=ytg.title_for(self.s.video(CID,VID))
         self.s.transition(run,CID,VID,'renamed',title)
@@ -128,7 +245,7 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(result['next']['id'],VID)
         self.assertIn('expected_title',result['next'])
         self.assertEqual(self.s.video(CID,OTHER)['state'],'pending')
-        self.assertEqual(self.fetches,1)
+        self.assertEqual(self.fetches,0)
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
     def test_break_finalization_keeps_prepared_generation_and_orders_backlog(self):
@@ -242,7 +359,7 @@ class EfficiencyTests(unittest.TestCase):
             return {'channel_id':CID,'entries':[{'id':f'{i:011d}','title':'t'} for i in range(50)]}
         result = ytg.scan(self.s,CID,fetch=fetch)
         self.assertTrue(result['complete'])
-        self.assertEqual(calls,[50,50,50])
+        self.assertEqual(calls,[50,50])
         self.assertTrue(all(t['scope']=='recent' for t in result['tabs']))
         self.assertEqual(self.s.video(CID,f'{59:011d}')['missing'],0)
         self.assertIsNone(self.s.channel(CID)['last_full'])
@@ -266,7 +383,7 @@ class EfficiencyTests(unittest.TestCase):
             calls.append(limit)
             return {'channel_id':CID,'entries':[]}
         self.assertTrue(ytg.scan(self.s,CID,full=True,fetch=fetch)['complete'])
-        self.assertEqual(calls,[None,None,None])
+        self.assertEqual(calls,[None,None])
         self.assertEqual(self.s.video(CID,VID)['missing'],1)
 
     def test_scan_does_not_write_after_lease_expires_during_fetch(self):
@@ -290,7 +407,7 @@ class EfficiencyTests(unittest.TestCase):
             result = ytg.scan(self.s,CID,fetch=fetch,run=resumed)
             self.assertEqual(resumed,run)
             self.assertEqual(result['skipped'],'already_checked_today')
-            self.assertEqual(len(calls),3)
+            self.assertEqual(len(calls),2)
 
     def test_missing_database_is_not_recreated_by_status(self):
         missing = Path(self.tmp.name)/'missing.sqlite3'

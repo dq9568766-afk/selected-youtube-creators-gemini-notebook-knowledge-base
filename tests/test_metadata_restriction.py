@@ -11,7 +11,7 @@ class MetadataRestrictionTests(unittest.TestCase):
     tearDown = fixtures.EfficiencyTests.tearDown
 
     def video(self):
-        self.s.insert(CID, {'id': VID, 'title': 'Members video'}, 'scan', True)
+        self.s.insert(CID, {'id': VID, 'title': VID}, 'scan', True)
     def test_members_only_is_deferred(self):
         self.video()
         run = self.s.begin('history')['id']
@@ -95,7 +95,7 @@ class MetadataRestrictionTests(unittest.TestCase):
         self.s.insert(CID, {'id':VID,'title':'Original'}, 'second', True)
         self.assertTrue(ytg.metadata_fresh(self.s.video(CID,VID)))
         self.s.insert(CID, {'id':VID,'title':'Changed'}, 'third', True)
-        self.assertFalse(ytg.metadata_fresh(self.s.video(CID,VID)))
+        self.assertTrue(ytg.metadata_fresh(self.s.video(CID,VID)))
         self.assertEqual(self.s.video(CID,VID)['published'], '20261026')
 
     def test_scan_updates_do_not_modify_submitted_metadata(self):

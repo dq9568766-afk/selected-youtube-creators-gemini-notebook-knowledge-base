@@ -29,11 +29,35 @@ CREATE TABLE IF NOT EXISTS run_inventory(run_id TEXT NOT NULL, channel_id TEXT N
  checked TEXT NOT NULL, PRIMARY KEY(run_id,channel_id));
 CREATE TABLE IF NOT EXISTS pacing(scope TEXT PRIMARY KEY, processed INTEGER NOT NULL DEFAULT 0,
  break_started REAL);
+CREATE TABLE IF NOT EXISTS browser_pacing(scope TEXT PRIMARY KEY, last_access REAL NOT NULL DEFAULT 0,
+ last_submit REAL NOT NULL DEFAULT 0,recovery_remaining INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS account_coordinator(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT,
+ channel_id TEXT, run_id TEXT, lease_until REAL NOT NULL DEFAULT 0,
+ last_kind TEXT, last_granted REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS pauses(scope TEXT PRIMARY KEY, reason TEXT NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS gemini_limit_events(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, detected REAL NOT NULL, reason TEXT NOT NULL,
+ scope TEXT NOT NULL, channel_id TEXT, run_id TEXT, video_id TEXT,
+ video_state TEXT, retry_count INTEGER, run_mode TEXT, policy TEXT,
+ armed INTEGER, daily_used INTEGER, account_processed INTEGER,
+ account_last_submit REAL, active_submission_count INTEGER NOT NULL DEFAULT 0,
+ source TEXT NOT NULL DEFAULT 'pause', observed_type TEXT, reset_at REAL);
+CREATE TABLE IF NOT EXISTS gemini_submission_events(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, submitted REAL NOT NULL, channel_id TEXT NOT NULL,
+ run_id TEXT NOT NULL, video_id TEXT NOT NULL, attempt INTEGER NOT NULL,
+ mode TEXT NOT NULL, policy TEXT NOT NULL, recovery_remaining INTEGER NOT NULL,
+ unresolved_submissions INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS gemini_limit_event_items(
+ event_id INTEGER NOT NULL, channel_id TEXT, run_id TEXT, video_id TEXT,
+ video_state TEXT, retry_count INTEGER, run_mode TEXT, policy TEXT,
+ armed INTEGER, daily_used INTEGER,
+ PRIMARY KEY(event_id,channel_id,video_id));
 CREATE TABLE IF NOT EXISTS channels(
  id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
  notebook TEXT UNIQUE, initialized INTEGER NOT NULL DEFAULT 0,
- last_full TEXT, last_check TEXT, turn INTEGER NOT NULL DEFAULT 0);
+ last_full TEXT, last_check TEXT, turn INTEGER NOT NULL DEFAULT 0,
+ tracking INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scans(
  channel_id TEXT NOT NULL REFERENCES channels(id), tab TEXT NOT NULL,
  count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
@@ -65,6 +89,7 @@ REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
 GLOBAL_PAUSES = {'quota','login','captcha','ui_changed','network'}
 BREAK_EVERY = 20
 BREAK_SECONDS = 120
+ACCOUNT_COORDINATOR_HOLD = 15
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
 CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
@@ -114,13 +139,18 @@ def title_for(row, topic=None):
     topic = topic or row['topic']
     if not topic or not re.fullmatch(r'[\u3400-\u4dbf\u4e00-\u9fff]{1,5}', topic):
         raise Stop('Topic must contain 1–5 Han characters')
+    if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg':
+        published = date_value(row['published'])
+        return f"{published}-{topic}-{row['title']}"
     prefix = f"{date_value(row['published'])}-" if row['published'] else ''
     return f"{prefix}{topic}-{row['title']}"
 
 
 def metadata_fresh(row):
-    # Date is optional for collection-first history processing. A usable
-    # inventory title is enough to prepare a summary without a detail lookup.
+    # Wang titles include the verified publication date. Do not arm a task
+    # whose target title cannot be computed without guessing that date.
+    if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
+        return False
     return bool(row['title'].strip()) and row['title'] != row['id']
 
 def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None,
@@ -145,11 +175,28 @@ class Store:
         self.db.execute('PRAGMA journal_mode=WAL')
         had_pacing = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacing'").fetchone())
         self.db.executescript(SCHEMA)
+        browser_columns={r['name'] for r in self.db.execute('PRAGMA table_info(browser_pacing)')}
+        if 'recovery_remaining' not in browser_columns:
+            self.db.execute('ALTER TABLE browser_pacing ADD COLUMN recovery_remaining INTEGER NOT NULL DEFAULT 0')
+        limit_columns={r['name'] for r in self.db.execute('PRAGMA table_info(gemini_limit_events)')}
+        if 'observed_type' not in limit_columns:
+            self.db.execute('ALTER TABLE gemini_limit_events ADD COLUMN observed_type TEXT')
+        if 'reset_at' not in limit_columns:
+            self.db.execute('ALTER TABLE gemini_limit_events ADD COLUMN reset_at REAL')
+        submission_columns={r['name'] for r in self.db.execute('PRAGMA table_info(gemini_submission_events)')}
+        if 'unresolved_submissions' not in submission_columns:
+            self.db.execute('ALTER TABLE gemini_submission_events ADD COLUMN unresolved_submissions INTEGER NOT NULL DEFAULT 0')
         import backfill
         self.db.executescript(backfill.SCHEMA)
         backfill.migrate(self)
         # Older task databases are upgraded in place without resetting task state.
         columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
+        channel_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(channels)')}
+        if 'tracking' not in channel_columns:
+            with self.tx():
+                self.db.execute('ALTER TABLE channels ADD COLUMN tracking INTEGER NOT NULL DEFAULT 0')
+                # A verified first summary opts the channel into daily tracking.
+                self.db.execute("UPDATE channels SET tracking=1 WHERE id IN (SELECT channel_id FROM videos WHERE state='verified')")
         if 'metadata_checked' not in columns:
             with self.tx():
                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
@@ -190,10 +237,10 @@ class Store:
             if 'reopen_required' not in columns:
                 self.db.execute('ALTER TABLE videos ADD COLUMN reopen_required TEXT')
                 self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE state IN ('summarized','renamed')")
-            if not had_pacing or self.setting('pacing_version')!='2':
+            if not had_pacing or self.setting('pacing_version')!='3':
                 seen=set()
                 for r in self.db.execute('SELECT * FROM runs ORDER BY rowid DESC').fetchall():
-                    key=r['channel_id'] or '*'
+                    key='gemini-account'
                     if key in seen:
                         continue
                     seen.add(key)
@@ -203,7 +250,19 @@ class Store:
                     if count>=BREAK_EVERY and started is None:
                         started=time.time()
                     self.db.execute('INSERT OR IGNORE INTO pacing VALUES(?,?,?)',(key,count,started))
-                self.set('pacing_version','2')
+                self.set('pacing_version','3')
+            self.db.execute("INSERT OR IGNORE INTO pacing(scope) VALUES('gemini-account')")
+            legacy=list(self.db.execute("SELECT processed,break_started FROM pacing WHERE scope NOT IN ('*','gemini-account')"))
+            if legacy:
+                processed=sum(x['processed'] for x in legacy)
+                starts=[x['break_started'] for x in legacy if x['break_started'] is not None]
+                self.db.execute("UPDATE pacing SET processed=max(processed,?),break_started=COALESCE(break_started,?) WHERE scope='gemini-account'",(processed,min(starts) if starts else None))
+                # These rows are from the pre-account-wide pacing model.  If
+                # left behind, every new CLI process migrates them again and
+                # recreates an already-finished batch break.  Account-wide
+                # pacing is authoritative now; retire only the obsolete
+                # counters, never video state or leases.
+                self.db.execute("UPDATE pacing SET processed=0,break_started=NULL WHERE scope NOT IN ('*','gemini-account')")
         self._migrate_pause()
         # Preserve an existing worker's ownership and expiry during the upgrade.
         with self.tx():
@@ -264,9 +323,142 @@ class Store:
         row=self.db.execute('SELECT reason FROM pauses ORDER BY updated DESC LIMIT 1').fetchone()
         return row[0] if row else ''
 
-    def set_pause(self,reason,cid=None):
+    def set_pause(self,reason,cid=None,observed_type=None,reset_at=None):
         scope='*' if reason in GLOBAL_PAUSES else (cid or '*')
+        event = self.record_gemini_limit(reason,cid,observed_type,reset_at) if reason in {'quota','captcha','network','login'} else None
         self.db.execute('INSERT OR REPLACE INTO pauses VALUES(?,?,?)',(scope,reason,time.time()))
+        return event
+
+    def record_gemini_limit(self,reason,cid=None,observed_type=None,reset_at=None):
+        """Record only queue/send metadata when Gemini reports a global block."""
+        all_active = self.db.execute("""
+            SELECT v.channel_id,v.id,v.state,v.retry_count,v.owner,
+                   r.id AS run_id,r.mode,r.policy,r.armed
+            FROM videos v LEFT JOIN runs r ON r.id=v.owner
+            WHERE v.state IN ('submitting','submitted','uncertain')
+              AND (? IS NULL OR v.channel_id=?)
+            ORDER BY v.found
+        """,(cid,cid)).fetchall()
+        active = all_active[0] if all_active else None
+        lease = self.db.execute("""
+            SELECT l.run_id,r.channel_id,r.mode,r.policy,r.armed
+            FROM lease l LEFT JOIN runs r ON r.id=l.run_id
+            WHERE l.expires>? AND (? IS NULL OR l.scope IN ('*',?))
+            ORDER BY l.last_seen DESC LIMIT 1
+        """,(time.time(),cid,cid)).fetchone()
+        run_id = active['run_id'] if active and active['run_id'] else (lease['run_id'] if lease else None)
+        run = self.db.execute('SELECT * FROM runs WHERE id=?',(run_id,)).fetchone() if run_id else None
+        channel_id = active['channel_id'] if active and len(all_active)==1 else (run['channel_id'] if run and not all_active else cid)
+        video_id = active['id'] if active else None
+        video_state = active['state'] if active else None
+        retry_count = active['retry_count'] if active else None
+        mode = run['mode'] if run else (lease['mode'] if lease else None)
+        policy = run['policy'] if run else (lease['policy'] if lease else None)
+        armed = run['armed'] if run else (lease['armed'] if lease else None)
+        pacing = self.db.execute("SELECT processed FROM pacing WHERE scope='gemini-account'").fetchone()
+        browser_pacing = self.db.execute("SELECT last_submit FROM browser_pacing WHERE scope='gemini-account'").fetchone()
+        daily_used = self.budget_used(channel_id) if channel_id else self.budget_used()
+        cur = self.db.execute("""
+            INSERT INTO gemini_limit_events(
+              detected,reason,scope,channel_id,run_id,video_id,video_state,
+              retry_count,run_mode,policy,armed,daily_used,account_processed,
+              account_last_submit,active_submission_count,observed_type,reset_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,(time.time(),reason,'*' if reason in GLOBAL_PAUSES else (cid or '*'),
+              channel_id,run_id,video_id,video_state,retry_count,mode,policy,armed,
+              daily_used,pacing['processed'] if pacing else 0,
+              browser_pacing['last_submit'] if browser_pacing else 0,
+              len(all_active),observed_type,reset_at))
+        event_id=cur.lastrowid
+        seen_runs=set()
+        for row in all_active:
+            row_channel=row['channel_id']
+            row_daily=self.budget_used(row_channel)
+            self.db.execute("""
+                INSERT INTO gemini_limit_event_items(
+                  event_id,channel_id,run_id,video_id,video_state,retry_count,
+                  run_mode,policy,armed,daily_used)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,(event_id,row_channel,row['run_id'],row['id'],row['state'],row['retry_count'],
+                  row['mode'],row['policy'],row['armed'],row_daily))
+            seen_runs.add(row['run_id'])
+        if lease:
+            lease_rows=self.db.execute("""
+                SELECT l.run_id,r.channel_id,r.mode,r.policy,r.armed
+                FROM lease l LEFT JOIN runs r ON r.id=l.run_id
+                WHERE l.expires>? AND (? IS NULL OR l.scope IN ('*',?))
+                ORDER BY l.last_seen DESC
+            """,(time.time(),cid,cid)).fetchall()
+            for row in lease_rows:
+                if row['run_id'] in seen_runs:
+                    continue
+                self.db.execute("""
+                    INSERT INTO gemini_limit_event_items(
+                      event_id,channel_id,run_id,video_id,video_state,retry_count,
+                      run_mode,policy,armed,daily_used)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,(event_id,row['channel_id'],row['run_id'],None,None,None,row['mode'],
+                      row['policy'],row['armed'],self.budget_used(row['channel_id']) if row['channel_id'] else self.budget_used()))
+        return {'event_id':event_id,'recorded':True,'active_channels':len({row['channel_id'] for row in all_active})}
+
+    def gemini_limit_report(self,channel_id=None):
+        where = ''
+        params = ()
+        if channel_id:
+            where = ' WHERE channel_id=? OR channel_id IS NULL'
+            params = (channel_id,)
+        total = self.db.execute('SELECT count(*) FROM gemini_limit_events'+where,params).fetchone()[0]
+        by_reason = [dict(x) for x in self.db.execute(
+            'SELECT reason,count(*) AS count FROM gemini_limit_events'+where+' GROUP BY reason ORDER BY count DESC,reason',params)]
+        by_channel = [dict(x) for x in self.db.execute(
+            "SELECT i.channel_id,COALESCE(c.name,i.channel_id,'global') AS channel_name,count(DISTINCT i.event_id) AS count "
+            "FROM gemini_limit_event_items i LEFT JOIN channels c ON c.id=i.channel_id "
+            "JOIN gemini_limit_events e ON e.id=i.event_id"+
+            (' WHERE e.channel_id=? OR e.channel_id IS NULL' if channel_id else '')+
+            ' GROUP BY i.channel_id,c.name ORDER BY count DESC',params)]
+        context = self.db.execute(
+            'SELECT count(*) AS total,coalesce(sum(video_id IS NOT NULL),0) AS with_video,'
+            'coalesce(sum(active_submission_count>0),0) AS active_submission_events,'
+            'coalesce(sum(retry_count>0),0) AS retry_context_events,'
+            'coalesce(sum(armed),0) AS armed_total FROM gemini_limit_events'+where,params).fetchone()
+        item_context = self.db.execute(
+            "SELECT count(DISTINCT i.event_id) AS item_events,"
+            "coalesce(sum(i.video_id IS NOT NULL),0) AS item_videos,"
+            "coalesce(sum(i.retry_count>0),0) AS item_retries "
+            "FROM gemini_limit_event_items i JOIN gemini_limit_events e ON e.id=i.event_id"+
+            (' WHERE e.channel_id=? OR e.channel_id IS NULL' if channel_id else ''),params).fetchone()
+        if item_context['item_events']:
+            context = dict(context)
+            context['with_video'] = item_context['item_videos']
+            context['active_submission_events'] = item_context['item_videos']
+            context['retry_context_events'] = item_context['item_retries']
+        recent = [dict(x) for x in self.db.execute(
+            'SELECT id,detected,reason,observed_type,reset_at,channel_id,run_id,video_id,video_state,retry_count,run_mode,policy,armed,daily_used,account_processed,account_last_submit FROM gemini_limit_events'+where+' ORDER BY detected DESC LIMIT 20',params)]
+        for event in recent:
+            event['detected_at'] = datetime.fromtimestamp(event.pop('detected')).astimezone().isoformat()
+            if event.get('reset_at'):
+                event['reset_at']=datetime.fromtimestamp(event['reset_at']).astimezone().isoformat()
+        submission_where=' WHERE channel_id=?' if channel_id else ''
+        submission_params=(channel_id,) if channel_id else ()
+        submissions=self.db.execute('SELECT count(*) AS attempts, count(DISTINCT channel_id) AS channels, '
+            'coalesce(sum(attempt>1),0) AS retries, coalesce(max(unresolved_submissions),0) AS peak_unresolved '
+            'FROM gemini_submission_events'+submission_where,submission_params).fetchone()
+        recent_submissions=[dict(x) for x in self.db.execute(
+            'SELECT submitted,channel_id,run_id,video_id,attempt,mode,policy,recovery_remaining,unresolved_submissions '
+            'FROM gemini_submission_events'+submission_where+' ORDER BY submitted DESC LIMIT 30',submission_params)]
+        for item in recent_submissions:
+            item['submitted_at']=datetime.fromtimestamp(item.pop('submitted')).astimezone().isoformat()
+        recommendations=[]
+        if context['active_submission_events']:
+            recommendations.append('限流发生时存在未完成发送，恢复前先核对当前视频，避免重复提交。')
+        if context['retry_context_events']:
+            recommendations.append('限流记录包含重试上下文，后续应单独比较首次提交与重试的触发比例。')
+        if total and not context['with_video']:
+            recommendations.append('限流发生时没有可关联的视频，说明暂停登记可能晚于页面提示；应在看到提示后立即登记。')
+        return {'total_events':total,'channel_id':channel_id,'by_reason':by_reason,
+                'by_channel':by_channel,'context':dict(context),
+                'recommendations':recommendations,'recent_events':recent,
+                'submission_history':dict(submissions),'recent_submissions':recent_submissions}
 
     def clear_pause(self,cid=None):
         self.db.execute('DELETE FROM pauses WHERE scope=?',(cid or '*',))
@@ -372,12 +564,87 @@ class Store:
             return dict(self.db.execute('SELECT * FROM runs WHERE id=?',(rid,)).fetchone())
 
     def _sync_pacing(self,run):
-        r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
-        key=r['channel_id'] or '*'
+        key='gemini-account'
         self.db.execute('INSERT OR IGNORE INTO pacing(scope) VALUES(?)',(key,))
         pace=self.db.execute('SELECT * FROM pacing WHERE scope=?',(key,)).fetchone()
         self.db.execute('UPDATE runs SET batch_count=?,batch_started=? WHERE id=?',(pace['processed'],pace['break_started'],run))
         return pace
+
+    def coordinator_status(self, at=None):
+        at=time.time() if at is None else at
+        self.db.execute('INSERT OR IGNORE INTO account_coordinator(singleton) VALUES(1)')
+        row=self.db.execute('SELECT * FROM account_coordinator WHERE singleton=1').fetchone()
+        result=dict(row)
+        result['active']=bool(row['owner'] and row['lease_until']>at)
+        result['seconds_remaining']=max(0,math.ceil(row['lease_until']-at))
+        return result
+
+    def _coordinator_wait(self,owner,at):
+        owner=owner or 'unscoped'
+        self.db.execute('INSERT OR IGNORE INTO account_coordinator(singleton) VALUES(1)')
+        row=self.db.execute('SELECT owner,lease_until FROM account_coordinator WHERE singleton=1').fetchone()
+        if row['owner'] and row['owner']!=owner and row['lease_until']>at:
+            return math.ceil(row['lease_until']-at)
+        return 0
+
+    def _coordinator_grant(self,owner,kind,at,lease_seconds):
+        owner=owner or 'unscoped'
+        run=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(owner,)).fetchone()
+        self.db.execute("""UPDATE account_coordinator
+            SET owner=?,channel_id=?,run_id=?,lease_until=?,last_kind=?,last_granted=?
+            WHERE singleton=1""",(owner,run['channel_id'] if run else None,
+            owner if run else None,at+lease_seconds,kind,at))
+
+    def _coordinator_release(self,owner):
+        self.db.execute("UPDATE account_coordinator SET owner=NULL,channel_id=NULL,run_id=NULL,lease_until=0 WHERE singleton=1 AND owner=?",(owner,))
+
+    def browser_access(self, kind='access', at=None, owner=None):
+        """Claim one shared Gemini UI action slot; callers must act immediately."""
+        if kind not in {'access','submit'}:
+            raise Stop('Browser pacing kind must be access or submit')
+        at=time.time() if at is None else at
+        with self.tx():
+            if owner:
+                run=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(owner,)).fetchone()
+                reason=self.pause_for(run['channel_id'] if run else None)
+                if reason:
+                    raise Stop('Paused: '+reason)
+            self.db.execute("INSERT OR IGNORE INTO browser_pacing(scope) VALUES('gemini-account')")
+            row=self.db.execute("SELECT * FROM browser_pacing WHERE scope='gemini-account'").fetchone()
+            access_interval=30 if row['recovery_remaining'] else 15
+            eligible=max(row['last_access']+access_interval,
+                         row['last_submit']+15 if kind=='submit' else 0)
+            remaining=max(math.ceil(eligible-at),self._coordinator_wait(owner,at))
+            if remaining:
+                return {'ready':False,'seconds_remaining':remaining,'kind':kind}
+            self._coordinator_grant(owner,kind,at,max(access_interval,15))
+            self.db.execute("UPDATE browser_pacing SET last_access=?,last_submit=CASE WHEN ?='submit' THEN ? ELSE last_submit END WHERE scope='gemini-account'",
+                            (at,kind,at))
+            return {'ready':True,'kind':kind}
+
+    def _claim_submit_slot(self, recovery_retry_exempt=False, owner=None):
+        """Called inside the transition transaction before committing a send intent."""
+        self.db.execute("INSERT OR IGNORE INTO browser_pacing(scope) VALUES('gemini-account')")
+        row=self.db.execute("SELECT * FROM browser_pacing WHERE scope='gemini-account'").fetchone()
+        at=time.time()
+        recovering=row['recovery_remaining']>0
+        access_interval=15 if recovery_retry_exempt else (30 if recovering else 15)
+        submit_interval=180 if recovering and not recovery_retry_exempt else 15
+        eligible=max(row['last_access']+access_interval,row['last_submit']+submit_interval)
+        remaining=max(math.ceil(eligible-at),self._coordinator_wait(owner,at))
+        if remaining:
+            return remaining
+        self._coordinator_grant(owner,'submit',at,ACCOUNT_COORDINATOR_HOLD)
+        if recovery_retry_exempt:
+            self.db.execute("UPDATE browser_pacing SET last_access=?,last_submit=? WHERE scope='gemini-account'",(at,at))
+        else:
+            self.db.execute("UPDATE browser_pacing SET last_access=?,last_submit=?,recovery_remaining=max(0,recovery_remaining-1) WHERE scope='gemini-account'",(at,at))
+        return 0
+
+    def _record_submission(self,run,cid,vid,attempt,recovery_remaining):
+        unresolved=self.db.execute("SELECT count(*) FROM videos WHERE state IN ('submitting','submitted','uncertain')").fetchone()[0]
+        self.db.execute("INSERT INTO gemini_submission_events(submitted,channel_id,run_id,video_id,attempt,mode,policy,recovery_remaining,unresolved_submissions) VALUES(?,?,?,?,?,?,?,?,?)",
+            (time.time(),cid,run['id'],vid,attempt,run['mode'],run['policy'],recovery_remaining,unresolved))
 
     def _break_remaining(self,run):
         pace=self._sync_pacing(run)
@@ -390,6 +657,10 @@ class Store:
         remaining=max(0,math.ceil(started+BREAK_SECONDS-time.time()))
         if remaining==0:
             self.db.execute('UPDATE pacing SET processed=0,break_started=NULL WHERE scope=?',(pace['scope'],))
+            # ``pace`` is the row read before the reset above.  Do not let the
+            # stale snapshot leak back into the run or make the next prepare
+            # believe that the same batch break is still active.
+            pace=self.db.execute('SELECT * FROM pacing WHERE scope=?',(pace['scope'],)).fetchone()
         self._sync_pacing(run)
         return remaining
 
@@ -398,14 +669,15 @@ class Store:
         if v['processed_counted']:
             return
         if run is None:
-            self.db.execute('INSERT OR IGNORE INTO pacing(scope) VALUES(?)',(cid,))
-            key=cid
+            key='gemini-account'
+            self.db.execute('INSERT OR IGNORE INTO pacing(scope) VALUES(?)',(key,))
         else:
             key=self._sync_pacing(run)['scope']
         self.db.execute('UPDATE videos SET processed_counted=1 WHERE channel_id=? AND id=?',(cid,vid))
         self.db.execute('UPDATE pacing SET processed=processed+1,break_started=CASE WHEN processed=? THEN ? ELSE break_started END WHERE scope=?',(BREAK_EVERY-1,time.time(),key))
         if run is not None:
             self._sync_pacing(run)
+            self._coordinator_release(run)
 
     def reserve(self,run,parallel=False):
         with self.tx():
@@ -472,6 +744,7 @@ class Store:
             self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE owner=? AND state='submitting'",(run,))
             self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state IN ('submitted','summarized','renamed')",(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
+            self._coordinator_release(run)
             return {'cleaned':True}
 
     def adopt_unknown(self,cid,evidence):
@@ -510,7 +783,10 @@ class Store:
 
     def daily_due(self,channel_id=None):
         if channel_id is None:
-            return any(self.daily_due(c[0]) for c in self.db.execute('SELECT id FROM channels WHERE initialized=1'))
+            return any(self.daily_due(c[0]) for c in self.db.execute('SELECT id FROM channels WHERE initialized=1 AND tracking=1'))
+        tracked = self.db.execute('SELECT 1 FROM channels WHERE id=? AND initialized=1 AND tracking=1',(channel_id,)).fetchone()
+        if not tracked:
+            return False
         t = now()
         if (t.hour,t.minute)<(5,0):
             return False
@@ -533,6 +809,7 @@ class Store:
             self.db.execute("UPDATE videos SET owner=NULL,reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state='summarized'",(run,))
             self.db.execute('UPDATE runs SET finished=1 WHERE id=?',(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
+            self._coordinator_release(run)
 
     def transition(self,run,cid,vid,action,value=None,evidence=None):
         with self.tx():
@@ -540,7 +817,19 @@ class Store:
             current_run=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
             if current_run['channel_id'] and current_run['channel_id']!=cid:
                 raise Stop('Video is outside run channel scope')
+            if action in {'arm','retry'}:
+                pause=self.pause_for(cid)
+                if pause:
+                    raise Stop('Submission blocked by '+pause+' pause')
             v = self.video(cid,vid)
+            if action == 'retitle':
+                if cid != 'UCBKDRq35-L8xev4O7ZqBeLg':
+                    raise Stop('Retitle maintenance is enabled only for the Wang Zhi\'an channel')
+                if v['state'] not in {'summarized','renamed','verified','deferred'}:
+                    raise Stop('Only an archived or explicitly deferred chat can be retitled')
+                if value != title_for(v) or evidence not in REOPEN_EVIDENCE | {CURRENT_PAGE_EVIDENCE}:
+                    raise Stop('Require the exact computed title and visible chat-title evidence')
+                return {'retitled':vid,'title':value,'state':v['state']}
             if v['owner'] != run:
                 reclaimable = (
                     action=='skip' and v['state']=='uncertain' and not v['chat'] and evidence=='search-no-result'
@@ -573,20 +862,36 @@ class Store:
                 if r['mode']=='incremental':
                     if self.budget_used(cid)>=20:
                         raise Stop('Channel daily submission budget exhausted')
+                recovery_remaining=self.db.execute("SELECT recovery_remaining FROM browser_pacing WHERE scope='gemini-account'").fetchone()
+                recovery_remaining=recovery_remaining['recovery_remaining'] if recovery_remaining else 0
+                wait=self._claim_submit_slot(owner=run)
+                if wait:
+                    return {'ready':False,'seconds_remaining':wait,'kind':'submit'}
+                if r['mode']=='incremental':
                     self.db.execute('INSERT INTO daily_budget VALUES(?,?,1) ON CONFLICT(channel_id,day) DO UPDATE SET used=used+1',(cid,now().date().isoformat()))
                 self.db.execute('UPDATE runs SET armed=armed+1 WHERE id=?',(run,))
                 self.db.execute("UPDATE videos SET state='submitting' WHERE channel_id=? AND id=?",args)
+                self._record_submission(r,cid,vid,1,recovery_remaining)
             elif action=='retry':
-                if (current_run['policy']!='collect-first' or v['state']!='submitted'
-                        or not v['chat'] or v['retry_count']!=0 or v['reopen_required']
-                        or evidence!='20s-no-body-stopped-same-chat'):
-                    raise Stop('Retry requires a confirmed same chat, no body after 20 seconds, stopped generation and no prior retry')
+                attached = v['state']=='submitted' and v['chat'] and evidence=='20s-no-body-stopped-same-chat'
+                current_page = (v['state']=='submitting' and not v['chat'] and
+                                evidence=='20s-no-body-stopped-current-page')
+                if (current_run['policy']!='collect-first' or not (attached or current_page)
+                        or v['retry_count']!=0 or v['reopen_required']):
+                    raise Stop('Retry requires confirmed first request, stopped generation, uninterrupted page and no prior retry')
                 if current_run['mode']=='incremental':
                     if current_run['armed']>=20 or self.budget_used(cid)>=20:
                         raise Stop('Submission budget exhausted; defer generation_timeout instead')
+                recovery_remaining=self.db.execute("SELECT recovery_remaining FROM browser_pacing WHERE scope='gemini-account'").fetchone()
+                recovery_remaining=recovery_remaining['recovery_remaining'] if recovery_remaining else 0
+                wait=self._claim_submit_slot(recovery_retry_exempt=(current_run['policy']=='collect-first'), owner=run)
+                if wait:
+                    return {'ready':False,'seconds_remaining':wait,'kind':'submit'}
+                if current_run['mode']=='incremental':
                     self.db.execute('INSERT INTO daily_budget VALUES(?,?,1) ON CONFLICT(channel_id,day) DO UPDATE SET used=used+1',(cid,now().date().isoformat()))
                 self.db.execute('UPDATE runs SET armed=armed+1 WHERE id=?',(run,))
                 self.db.execute("UPDATE videos SET state='submitting',retry_count=retry_count+1 WHERE channel_id=? AND id=?",args)
+                self._record_submission(current_run,cid,vid,2,recovery_remaining)
             elif action=='attach':
                 if v['state'] not in {'submitting','uncertain','submitted'}:
                     raise Stop('Attach is only valid after a submission intent or during reconciliation')
@@ -615,6 +920,7 @@ class Store:
                 if v['reopen_required'] and evidence not in REOPEN_EVIDENCE:
                     raise Stop('This chat requires reopened verification after '+v['reopen_required'])
                 self.db.execute("UPDATE videos SET state='verified',owner=NULL,reason=NULL,reopen_required=NULL WHERE channel_id=? AND id=?",args)
+                self.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(cid,))
                 self._count_processed(run,cid,vid)
             elif action=='require-reopen':
                 if value not in REOPEN_REASONS or v['state'] not in {'submitting','submitted','summarized','renamed','uncertain'}:
@@ -684,6 +990,7 @@ class Store:
             self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE owner=? AND state='reserved'",(run,))
             self.db.execute('UPDATE runs SET finished=1 WHERE id=?',(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
+            self._coordinator_release(run)
 
     def handoff(self,run):
         r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
@@ -711,8 +1018,9 @@ class Store:
                     'leases':[dict(x) for x in self.db.execute('SELECT scope,run_id,expires FROM lease WHERE expires>?',(time.time(),))],
                     'daily_due':self.daily_due(channel_id), 'channel_id':channel_id,
                     'daily_used':self.budget_used(channel_id),
+                    'coordinator':self.coordinator_status(),
                     'states':[dict(x) for x in self.db.execute('SELECT history,state,count(*) AS count FROM videos'+(' WHERE channel_id=?' if channel_id else '')+' GROUP BY history,state',(channel_id,) if channel_id else ())]}
-        return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
+        return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'coordinator':self.coordinator_status(), 'channels':[dict(x) for x in self.db.execute('SELECT * FROM channels')],
                 'states':[dict(x) for x in self.db.execute('SELECT state,history,count(*) AS count FROM videos GROUP BY state,history')],
                 'scans':[dict(x) for x in self.db.execute('SELECT * FROM scans')],
                 'lease':[dict(x) for x in self.db.execute('SELECT * FROM lease')]}
@@ -834,7 +1142,8 @@ def scan(s,cid,full=False,fetch=extract,run=None):
         with s.tx():
             if run: s.check_lease(run)
             s.set(initial_key,stamp)
-    for tab in ('videos','shorts','streams'):
+    # Shorts are outside this project's summary scope. Do not fetch or enqueue them.
+    for tab in ('videos','streams'):
         try:
             saved=s.db.execute('SELECT status,checked FROM scans WHERE channel_id=? AND tab=?',(cid,tab)).fetchone()
             if not c['initialized'] and saved and saved['checked']>=s.setting(initial_key) and saved['status'] in {'ok','absent'}:
@@ -998,6 +1307,7 @@ def main(argv=None):
     p.add_argument('--verbose',action='store_true',help='Return full records for troubleshooting')
     sub = p.add_subparsers(dest='cmd',required=True)
     a = sub.add_parser('status'); a.add_argument('--channel')
+    a = sub.add_parser('pace'); a.add_argument('kind',choices=['access'],help='Claim a slot before one non-submission Gemini UI action'); a.add_argument('--run',help='Current run that owns the account coordination slot')
     a = sub.add_parser('metadata-backfill'); a.add_argument('operation',choices=['start','run','status','report','resume']); a.add_argument('job',nargs='?'); a.add_argument('--channel'); a.add_argument('--confirmed',action='store_true')
     a = sub.add_parser('add'); a.add_argument('url')
     a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
@@ -1007,9 +1317,12 @@ def main(argv=None):
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
-    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
+    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','retitle','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
     a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history'); a.add_argument('--channel')
+    a = sub.add_parser('gemini-limit-report'); a.add_argument('--channel')
     a = sub.add_parser('pause'); a.add_argument('reason',choices=sorted(REASONS)); a.add_argument('--channel')
+    a.add_argument('--limit-type',choices=['temporary_rate_limit','usage_exhausted','high_traffic','captcha','login_required','robot_suspected','service_error','unknown'])
+    a.add_argument('--reset-at',help='Visible Gemini reset time in ISO-8601 including timezone')
     a = sub.add_parser('resume'); a.add_argument('--confirmed',action='store_true',required=True); a.add_argument('--channel')
     a = sub.add_parser('adopt-unknown'); a.add_argument('--channel',required=True); a.add_argument('--evidence',required=True)
     args = p.parse_args(argv)
@@ -1019,6 +1332,7 @@ def main(argv=None):
             raise Stop('Task database is missing; refusing to create an empty replacement')
         s = Store(args.db)
         if args.cmd=='status': result=s.status(verbose=args.verbose,channel_id=args.channel)
+        elif args.cmd=='pace': result=s.browser_access(args.kind,owner=args.run)
         elif args.cmd=='metadata-backfill':
             import backfill
             if args.operation=='start':
@@ -1035,6 +1349,7 @@ def main(argv=None):
                 if not args.job: raise Stop('Job ID is required')
                 result=backfill.step(s,args.job) if args.operation=='run' else backfill.report(s,args.job)
         elif args.cmd=='report': result=s.report(args.mode,args.channel)
+        elif args.cmd=='gemini-limit-report': result=s.gemini_limit_report(args.channel)
         elif args.cmd=='add': result=add_channel(s,args.url)
         elif args.cmd=='notebook':
             gemini_url(args.url,'notebook')
@@ -1072,12 +1387,33 @@ def main(argv=None):
         elif args.cmd=='pause':
             if args.reason in GLOBAL_PAUSES and args.channel: raise Stop('Global pause reasons cannot use --channel')
             if args.reason not in GLOBAL_PAUSES and not args.channel: raise Stop('Channel pause reasons require --channel')
-            with s.tx(): s.set_pause(args.reason,args.channel)
+            reset_at=None
+            if args.reset_at:
+                try:
+                    parsed=datetime.fromisoformat(args.reset_at)
+                    if parsed.tzinfo is None: raise ValueError('timezone required')
+                    reset_at=parsed.timestamp()
+                except ValueError: raise Stop('--reset-at must be ISO-8601 with an explicit timezone')
+            if args.limit_type and args.reason not in {'quota','captcha','network','login'}:
+                raise Stop('--limit-type requires quota, captcha, network, or login pause')
+            if args.reset_at and args.reason!='quota': raise Stop('--reset-at is only valid for quota pause')
+            with s.tx(): event=s.set_pause(args.reason,args.channel,args.limit_type,reset_at)
             result={'paused':args.reason,'channel_id':args.channel}
+            if event:
+                result['gemini_limit_event']=event
+                result['gemini_limit_report']=s.gemini_limit_report(args.channel)
         elif args.cmd=='resume':
             # Must only be called after human approval; never by a timer.
             with s.tx():
+                if not args.channel:
+                    pause=s.db.execute("SELECT reason FROM pauses WHERE scope='*'").fetchone()
+                    if pause and pause['reason']=='quota':
+                        reset=s.db.execute("SELECT reset_at FROM gemini_limit_events WHERE reason='quota' AND reset_at IS NOT NULL ORDER BY detected DESC LIMIT 1").fetchone()
+                        if reset and reset['reset_at']>time.time():
+                            raise Stop('Gemini quota reset time has not arrived; keep the global pause until the displayed time')
                 s.clear_pause(args.channel)
+                s.db.execute("INSERT OR IGNORE INTO browser_pacing(scope) VALUES('gemini-account')")
+                s.db.execute("UPDATE browser_pacing SET recovery_remaining=3 WHERE scope='gemini-account'")
                 if args.channel:
                     s.db.execute('UPDATE lease SET expires=0 WHERE scope IN (?,?)',(args.channel,'*'))
                 else:

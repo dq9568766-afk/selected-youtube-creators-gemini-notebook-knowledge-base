@@ -14,7 +14,7 @@ class ChannelLeaseTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'tasks.sqlite3'
         self.s = ytg.Store(self.path)
         for cid in ('a', 'b'):
-            self.s.db.execute('INSERT INTO channels(id,url,name) VALUES(?,?,?)',
+            self.s.db.execute('INSERT INTO channels(id,url,name,initialized,tracking) VALUES(?,?,?,1,1)',
                               (cid, 'https://www.youtube.com/@'+cid, cid))
 
     def tearDown(self):

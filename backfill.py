@@ -1,7 +1,11 @@
 """Resumable public metadata collection; no Gemini operations."""
 import json
 import math
+import os
 import time
+import urllib.parse
+import urllib.request
+import urllib.error
 import uuid
 
 SCHEMA = """
@@ -47,6 +51,31 @@ def fetch(s,url,flat=False,limit=None,extractor=None):
             if not str(exc).startswith('metadata_wait:'): raise
             time.sleep(min(30,int(str(exc).split(':')[1])))
     try:
+        key = os.environ.get('YOUTUBE_DATA_API_KEY')
+        if key and not flat:
+            parsed = urllib.parse.urlparse(url)
+            video = urllib.parse.parse_qs(parsed.query).get('v', [None])[0]
+            if not video:
+                raise ValueError('YouTube URL has no video ID')
+            api_url = 'https://www.googleapis.com/youtube/v3/videos?' + urllib.parse.urlencode({
+                'part': 'snippet', 'id': video, 'key': key,
+            })
+            with urllib.request.urlopen(api_url, timeout=30) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            items = payload.get('items') or []
+            if not items:
+                raise ValueError('YouTube Data API returned no item')
+            item = items[0]
+            snippet = item.get('snippet') or {}
+            published = snippet.get('publishedAt') or ''
+            return {
+                'id': item.get('id'),
+                'channel_id': snippet.get('channelId'),
+                'title': snippet.get('title') or '',
+                'release_date': published[:10].replace('-', '') or None,
+                'upload_date': published[:10].replace('-', '') or None,
+                'live_status': 'not_live',
+            }
         return (extractor or extract)(url,flat,limit) if flat else (extractor or extract)(url,False)
     except Exception as exc:
         category=metadata_failure(exc)
@@ -118,7 +147,93 @@ def report(s,job):
                 date_coverage=counts.get('complete',0)/total if total else 1,
                 access=dict(s.db.execute('SELECT * FROM metadata_access WHERE id=1').fetchone()))
 
+def api_batch(s, ids):
+    """Fetch up to 50 videos with one official YouTube Data API request."""
+    from ytg import Stop
+    key = os.environ.get('YOUTUBE_DATA_API_KEY')
+    if not key or not ids:
+        raise Stop('YOUTUBE_DATA_API_KEY is required for API batch mode')
+    while True:
+        try:
+            gate(s)
+            break
+        except Stop as exc:
+            if not str(exc).startswith('metadata_wait:'):
+                raise
+            time.sleep(min(30, int(str(exc).split(':')[1])))
+    api_url = 'https://www.googleapis.com/youtube/v3/videos?' + urllib.parse.urlencode({
+        'part': 'snippet', 'id': ','.join(ids), 'key': key,
+    })
+    try:
+        with urllib.request.urlopen(api_url, timeout=30) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403, 429}:
+            with s.tx():
+                s.db.execute('UPDATE metadata_access SET blocked=? WHERE id=1',
+                             ('youtube_api_http_'+str(exc.code),))
+        raise
+    return {item.get('id'): item for item in payload.get('items', [])}
+
+def batch_step(s,job):
+    """Process a maximum API page of 50 pending IDs in one transaction."""
+    from ytg import Stop, date_value
+    r=report(s,job); cid=r['channel_id']; now=time.time()
+    with s.tx():
+        if r['status']=='review': raise Stop('Metadata job requires review')
+        if s.pause_for(cid): raise Stop('Paused: '+s.pause_for(cid))
+        if any(x['expires']>now for x in s.conflicting_leases(cid)):
+            raise Stop('Another worker owns the queue scope')
+        s.db.execute('UPDATE metadata_items SET state=\'pending\' WHERE job=? AND state=\'fetching\'',(job,))
+        rows=s.db.execute('''SELECT v.id FROM metadata_items m JOIN videos v
+                             ON v.id=m.video AND v.channel_id=?
+                             WHERE m.job=? AND m.state='pending' AND m.retry_after<=?
+                             ORDER BY m.attempts,v.found LIMIT 50''',(cid,job,now)).fetchall()
+        if not rows:
+            s.db.execute("UPDATE metadata_jobs SET status='complete' WHERE id=? AND NOT EXISTS (SELECT 1 FROM metadata_items WHERE job=? AND state IN ('pending','fetching','review'))",(job,job))
+            return report(s,job)
+        ids=[row['id'] for row in rows]
+        s.db.execute('INSERT OR REPLACE INTO lease(scope,run_id,expires,last_seen) VALUES(?,?,?,?)',(cid,job,now+900,now))
+        s.db.executemany("UPDATE metadata_items SET state='fetching' WHERE job=? AND video=?",[(job,vid) for vid in ids])
+    try:
+        items=api_batch(s,ids)
+        checked=time.time()
+        with s.tx():
+            s.check_lease(job)
+            for vid in ids:
+                item=items.get(vid); snippet=(item or {}).get('snippet') or {}
+                if not item:
+                    state,reason='unavailable','not_found'
+                    date=None
+                elif snippet.get('channelId')!=cid:
+                    state,reason='review','identity_mismatch'; date=None
+                else:
+                    raw=snippet.get('publishedAt') or ''
+                    try: date=date_value(raw[:10].replace('-',''))
+                    except (Stop,TypeError): state,reason='unavailable','date_not_public'; date=None
+                    else: state,reason='complete',None
+                s.db.execute('''UPDATE metadata_items SET state=?,reason=?,release_date=?,upload_date=?,
+                                date_source=?,checked=? WHERE job=? AND video=?''',
+                             (state,reason,date,date,'publishedAt' if date else None,checked,job,vid))
+                if state=='complete':
+                    s.db.execute('''UPDATE videos SET published=?,metadata_checked=?,
+                                    title=CASE WHEN state='pending' THEN ? ELSE title END
+                                    WHERE channel_id=? AND id=? AND (chat IS NULL OR published IS NULL)''',
+                                 (date,checked,snippet.get('title') or '',cid,vid))
+        return {'job':job,'state':'batch_complete','count':len(ids),'matched':len(items)}
+    except Exception as exc:
+        with s.tx():
+            for vid in ids:
+                attempts=s.db.execute('SELECT attempts FROM metadata_items WHERE job=? AND video=?',(job,vid)).fetchone()[0]+1
+                backoff=(60,300,900)[min(attempts-1,2)]
+                s.db.execute("UPDATE metadata_items SET state='pending',reason='metadata_error',attempts=?,retry_after=?,checked=? WHERE job=? AND video=?",(attempts,time.time()+backoff,time.time(),job,vid))
+        raise
+    finally:
+        with s.tx(): s.db.execute('DELETE FROM lease WHERE run_id=?',(job,))
+
 def step(s,job,extractor=None):
+    if os.environ.get('YOUTUBE_DATA_API_KEY') and extractor is None:
+        return batch_step(s,job)
     from ytg import Stop,date_value,metadata_failure,MetadataFailure
     r=report(s,job); cid=r['channel_id']
     with s.tx():

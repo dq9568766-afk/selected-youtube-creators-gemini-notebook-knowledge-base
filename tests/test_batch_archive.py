@@ -25,6 +25,8 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.local = patch('ytg.now', return_value=datetime(2026, 10, 27, 4, 0))
         self.local.start()
         self.s = ytg.Store(self.path)
+        self.browser_gate=patch.object(self.s,'_claim_submit_slot',return_value=0)
+        self.browser_gate.start()
         for cid, book in ((CID,BOOK),(OTHER,BOOK.replace('1','2'))):
             self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
                               (cid,'https://www.youtube.com/channel/'+cid,'fixture',book))
@@ -33,6 +35,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.run = self.s.begin('history',channel_id=CID,policy='collect-first')['id']
 
     def tearDown(self):
+        self.browser_gate.stop()
         self.s.db.close()
         self.local.stop()
         self.clock.stop()
@@ -55,7 +58,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         return self.archive(self.generate())
 
     def count(self):
-        return self.s.db.execute('SELECT processed FROM pacing WHERE scope=?',(CID,)).fetchone()[0]
+        return self.s.db.execute("SELECT processed FROM pacing WHERE scope='gemini-account'").fetchone()[0]
 
     def test_summary_next_returns_same_chat_then_verify_next_advances(self):
         item = self.generate()
@@ -102,7 +105,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         item=self.generate()
         self.tick.return_value=10050.
         self.s.transition(self.run,CID,item['id'],'renamed',item['expected_title'])
-        self.assertIsNone(self.s.db.execute('SELECT break_started FROM pacing WHERE scope=?',(CID,)).fetchone()[0])
+        self.assertIsNone(self.s.db.execute("SELECT break_started FROM pacing WHERE scope='gemini-account'").fetchone()[0])
         self.tick.return_value=10060.
         result=ytg.advance(self.s,self.run,CID,item['id'],'verify',item['expected_title'],ytg.CURRENT_PAGE_EVIDENCE)
         self.assertEqual(result['next'],{'stop':'break_required','seconds_remaining':120})
@@ -265,7 +268,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.s.transition(self.run,CID,item['id'],'defer','archive_unverified')
         self.assertEqual(self.count(),2)
 
-    def test_channel_pause_and_pacing_are_isolated(self):
+    def test_channel_pause_is_isolated_and_pacing_is_account_shared(self):
         for _ in range(20):
             self.finish()
         self.s.set_pause('source_unavailable',CID)

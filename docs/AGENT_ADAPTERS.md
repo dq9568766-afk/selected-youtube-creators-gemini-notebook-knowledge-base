@@ -12,7 +12,8 @@
 2. 在项目根目录运行 `python ytg.py status`，并读取结构化结果。
 3. 在不复制数据库的前提下访问项目配置的唯一任务数据库；本项目当前 Windows 部署使用 `%LOCALAPPDATA%\youtube-gemini-channel-summarizer\tasks.sqlite3`。
 4. 通过用户已有的登录会话打开和操作 Gemini 网页，查看实际消息、生成结果、聊天 URL 和 Notebook 归属。
-5. 在不确定消息是否提交时保留证据并遵守运行策略：strict暂停，collect-first按docs/WORKER.md登记单条延期；未知提交不重发。仅已确认提交且无页面中断的聊天，才可按WORKER使用20秒无正文、确认停止后的同聊天一次重试。
+5. 在不确定消息是否提交时保留证据并遵守运行策略：strict暂停，collect-first按docs/WORKER.md登记单条延期；未知提交不重发。仅已确认提交且页面未跳转或中断时，才可按WORKER在20秒无正文并确认停止后于当前输入框重试一次；重试前不要求聊天地址。
+6. Gemini 非提交 UI 动作前运行 `python ytg.py pace access --run RUN`；只在返回 ready=true 后立即执行一个动作。协调权只覆盖当前页面动作窗口，其他频道可以并行等待生成，但页面动作和提交必须按账号顺序执行；arm/retry 负责原子检查并登记提交时间；ready=false 时按返回的秒数等待，不做网页操作。
 
 恢复约定：collect-first的临时连接/页面故障按docs/WORKER.md执行最多3次有限恢复；strict自动重连一次。已知账号或服务全局暂停后，用户明确继续/恢复才进行页面检查，不追加确认。恢复时读取详细租约状态，其他有效租约不得抢占。有限恢复失败时保留准确全局暂停、cleanup并结束，不重发或循环探测。
 
@@ -20,6 +21,7 @@
 
 ## Codex
 
+- 每次开始或恢复队列处理，先明确选用 Codex 内置浏览器并打开登记的 Gemini Notebook 工作标签，再运行队列状态命令。不要假定浏览器面板、工具存在或旧回合标签就代表本轮已建立可用会话；按 WORKER 验证页面可读和交互后才继续。
 - 将本项目目录作为 canonical 技能源；Codex 个人技能入口可指向项目根目录，避免维护第二份内容。目录移动后需更新该入口。
 - 使用 Codex 当前可用且已登录的浏览器会话。实际会话是否能访问 Gemini，以当前 UI 和工具检查为准。
 - 按仓库 `AGENTS.md` 和 `docs/WORKER.md` 执行状态机；状态门槛适用于所有智能体。

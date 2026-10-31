@@ -14,12 +14,15 @@ class DailyWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.s = ytg.Store(Path(self.tmp.name) / 'tasks.sqlite3')
+        self.browser_gate=patch.object(self.s,'_claim_submit_slot',return_value=0)
+        self.browser_gate.start()
         self.clock = patch('ytg.now', return_value=datetime(2026, 10, 30, 12))
         self.clock.start()
-        self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
+        self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized,tracking) VALUES(?,?,?,?,1,1)',
                           (CID, 'https://www.youtube.com/@fixture', 'fixture', BOOK))
 
     def tearDown(self):
+        self.browser_gate.stop()
         self.clock.stop()
         self.s.db.close()
         self.tmp.cleanup()
@@ -34,16 +37,34 @@ class DailyWorkflowTests(unittest.TestCase):
         return vid
 
     def test_handoff_scans_then_returns_to_history_with_policy(self):
-        self.add(1, True)
         history = self.s.begin('history', channel_id=CID, policy='collect-first')['id']
         self.assertEqual(ytg.prepare(self.s, history)['stop'], 'daily_due')
         daily = self.s.handoff(history)['run']
         self.assertEqual(self.s.db.execute('SELECT policy FROM runs WHERE id=?', (daily,)).fetchone()[0], 'collect-first')
-        ytg.scan(self.s, CID, fetch=lambda *a, **k: {'channel_id': CID, 'entries':[{'id':f'{1:011d}', 'title':'标题'}]}, run=daily)
+        ytg.scan(self.s, CID, fetch=self.fetch, run=daily)
         restored = self.s.handoff(daily)
         self.assertEqual(restored['policy'], 'collect-first')
-        self.assertEqual(ytg.prepare(self.s, restored['run'])['id'], f'{1:011d}')
+        self.assertEqual(ytg.prepare(self.s, restored['run']), {'stop':'empty'})
         self.assertFalse(self.s.status(False, CID)['daily_due'])
+
+    def test_due_incremental_precedes_remaining_history_tasks(self):
+        vid=self.add(1,True)
+        history=self.s.begin('history',channel_id=CID,policy='collect-first')['id']
+        self.assertEqual(ytg.prepare(self.s,history)['stop'], 'daily_due')
+        daily = self.s.handoff(history)['run']
+        self.assertEqual(self.s.db.execute('SELECT mode FROM runs WHERE id=?', (daily,)).fetchone()[0], 'incremental')
+
+    def test_untracked_channel_is_not_daily_due(self):
+        self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
+        self.assertFalse(self.s.daily_due(CID))
+        self.assertFalse(self.s.status(False, CID)['daily_due'])
+
+    def test_aggregate_daily_due_ignores_untracked_channels(self):
+        self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
+        other = 'UC8UCbiPrm2zN9nZHKdTevZA'
+        self.s.db.execute('INSERT INTO channels(id,url,name,initialized,tracking) VALUES(?,?,?,1,0)',
+                          (other, 'https://www.youtube.com/@other', 'other'))
+        self.assertFalse(self.s.daily_due())
 
     def test_scheduled_end_requires_successful_scan_and_settled_tasks(self):
         daily = self.s.begin('incremental', scheduled=True, channel_id=CID)['id']
@@ -90,7 +111,7 @@ class DailyWorkflowTests(unittest.TestCase):
         with patch.object(ytg, 'extract') as fetch:
             fetch.return_value = self.fetch()
             result = ytg.scan(self.s, CID, fetch=fetch, run=run)
-            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(fetch.call_count, 2)
             self.assertNotIn('skipped', result)
 
     def test_initial_partial_scan_is_frozen_and_committed_once(self):
@@ -98,20 +119,29 @@ class DailyWorkflowTests(unittest.TestCase):
         old = {'id': 'aaaaaaaaaaa', 'title': '旧视频', 'upload_date': '20261029'}
         new = {'id': 'bbbbbbbbbbb', 'title': '新视频', 'upload_date': '20261030'}
         def first(url, *a, **k):
-            if url.endswith('/shorts'):
-                raise RuntimeError('network')
             return {'channel_id': CID, 'entries': [old] if url.endswith('/videos') else []}
-        self.assertFalse(ytg.scan(self.s, CID, fetch=first)['complete'])
-        self.assertEqual(self.s.db.execute('SELECT count(*) FROM videos').fetchone()[0], 0)
+        self.assertTrue(ytg.scan(self.s, CID, fetch=first)['complete'])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM videos').fetchone()[0], 1)
         calls = []
         def retry(url, *a, **k):
             calls.append(url)
             return {'channel_id': CID, 'entries': []}
         self.assertTrue(ytg.scan(self.s, CID, fetch=retry)['complete'])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(self.s.video(CID, old['id'])['history'], 1)
         ytg.scan(self.s, CID, fetch=lambda url, *a, **k: {'channel_id': CID, 'entries': [new, old] if url.endswith('/videos') else []})
         self.assertEqual(self.s.video(CID, new['id'])['history'], 0)
+
+    def test_scan_excludes_shorts_from_fetch_and_inventory(self):
+        calls = []
+        short = {'id': 'ccccccccccc', 'title': '不应入库'}
+        def fetch(url, *a, **k):
+            calls.append(url)
+            return {'channel_id': CID, 'entries': [short] if url.endswith('/shorts') else []}
+        result = ytg.scan(self.s, CID, fetch=fetch)
+        self.assertTrue(result['complete'])
+        self.assertFalse(any(url.endswith('/shorts') for url in calls))
+        self.assertIsNone(self.s.db.execute('SELECT 1 FROM videos WHERE id=?', (short['id'],)).fetchone())
 
     def test_missing_inventory_is_explicit_review(self):
         vid = self.add(1, True)

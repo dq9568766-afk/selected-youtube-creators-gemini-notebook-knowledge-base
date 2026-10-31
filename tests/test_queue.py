@@ -17,9 +17,12 @@ class QueueTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.s=ytg.Store(Path(self.tmp.name)/'tasks.sqlite3')
+        self.browser_gate=patch.object(self.s,'_claim_submit_slot',return_value=0)
+        self.browser_gate.start()
         self.channel(CID)
 
     def tearDown(self):
+        self.browser_gate.stop()
         self.s.db.close()
         self.tmp.cleanup()
 
@@ -216,16 +219,16 @@ class QueueTests(unittest.TestCase):
         self.s.transition(run,CID,VID,'arm')
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],31)
 
-    def test_partial_inventory_does_not_mark_missing_or_initialized(self):
+    def test_shorts_failure_is_ignored_and_other_tabs_complete_inventory(self):
         self.video()
         self.s.db.execute('UPDATE channels SET initialized=0')
         def fetch(url,flat):
             if url.endswith('shorts'): raise RuntimeError('network failed')
             return {'channel_id':CID,'entries':[]}
         result=ytg.scan(self.s,CID,True,fetch)
-        self.assertFalse(result['complete'])
-        self.assertEqual(self.s.channel(CID)['initialized'],0)
-        self.assertEqual(self.s.video(CID,VID)['missing'],0)
+        self.assertTrue(result['complete'])
+        self.assertEqual(self.s.channel(CID)['initialized'],1)
+        self.assertEqual(self.s.video(CID,VID)['missing'],1)
 
     def test_absent_tab_is_not_network_failure(self):
         def fetch(url,flat):
