@@ -88,7 +88,7 @@ REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
            'source_unavailable','metadata_unavailable','live_not_ready','ambiguous_match','save_unverified'}
 GLOBAL_PAUSES = {'quota','login','captcha','ui_changed','network'}
 BREAK_EVERY = 20
-BREAK_SECONDS = 120
+BREAK_SECONDS = 90
 ACCOUNT_COORDINATOR_HOLD = 15
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
@@ -152,6 +152,19 @@ def metadata_fresh(row):
     if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
         return False
     return bool(row['title'].strip()) and row['title'] != row['id']
+
+def inventory_date(entry):
+    try:
+        return date_value(entry.get('release_date') or entry.get('upload_date'))
+    except (Stop, TypeError):
+        return None
+
+def date_boundary_requires_full(previous_checked, entries):
+    if not previous_checked:
+        return False
+    boundary = previous_checked[:10]
+    dates = [d for d in (inventory_date(entry) for entry in entries) if d]
+    return bool(dates and min(dates) > boundary)
 
 def generation_decision(elapsed, substantive=False, growing=False, complete=False, blocker=None,
                         policy="collect-first", retry_count=0):
@@ -747,12 +760,12 @@ class Store:
             self._coordinator_release(run)
             return {'cleaned':True}
 
-    def adopt_unknown(self,cid,evidence):
+    def adopt_unknown(self,cid,evidence,run_id=None):
         with self.tx():
             if evidence!='notebook-identity-checked':
                 raise Stop('Notebook identity evidence required')
             self.channel(cid)
-            if any(l['expires']>time.time() for l in self.conflicting_leases(cid)):
+            if any(l['expires']>time.time() and l['run_id']!=run_id for l in self.conflicting_leases(cid)):
                 raise Stop('Another worker owns the queue')
             items=self.db.execute("SELECT id FROM videos WHERE channel_id=? AND history=1 AND state IN ('uncertain','submitting')",(cid,)).fetchall()
             for item in items:
@@ -849,7 +862,7 @@ class Store:
             args = (cid,vid)
             if action=='arm':
                 if self._break_remaining(run):
-                    raise Stop('Finish the 120-second break before submitting')
+                    raise Stop(f'Finish the {BREAK_SECONDS}-second break before submitting')
                 scope=' AND channel_id=?' if current_run['channel_id'] else ''
                 params=(v['history'],vid,current_run['channel_id']) if current_run['channel_id'] else (v['history'],vid)
                 if self.db.execute("SELECT 1 FROM videos WHERE history=? AND id<>? AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',params).fetchone():
@@ -1132,7 +1145,8 @@ def scan(s,cid,full=False,fetch=extract,run=None):
             checked=s.db.execute('SELECT checked FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid)).fetchone()
             if (day and checked and checked[0][:10]==now().date().isoformat()
                     and (not full or (c['last_full'] or '')[:10]==now().date().isoformat())):
-                return {'channel_id':cid,'complete':True,'skipped':'already_checked_today','tabs':[]}
+                return {'channel_id':cid,'complete':True,'skipped':'already_checked_today','tabs':[],
+                        'date_coverage':'full' if full else 'recent-window','excluded_tabs':['shorts']}
             s.db.execute('DELETE FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid))
     stamp = now().isoformat()
     complete = True
@@ -1155,7 +1169,13 @@ def scan(s,cid,full=False,fetch=extract,run=None):
             entries = info.get('entries',[])
             if info.get('channel_id') not in {None,cid}:
                 raise Stop('Channel identity changed')
-            if windowed and len(entries)>=SCAN_WINDOW:
+            if windowed and date_boundary_requires_full(saved['checked'] if saved else None, entries):
+                info = fetch(url,True)
+                entries = info.get('entries',[])
+                if info.get('channel_id') not in {None,cid}:
+                    raise Stop('Channel identity changed')
+                windowed = False
+            elif windowed and len(entries)>=SCAN_WINDOW:
                 # A recent-page overlap avoids re-reading thousands of old entries.
                 # No stable overlap means a backlog: fall back to the full tab.
                 overlap = all(e and s.db.execute('SELECT 1 FROM videos WHERE channel_id=? AND id=?',
@@ -1211,7 +1231,18 @@ def scan(s,cid,full=False,fetch=extract,run=None):
                 # Missing means absent from a complete public listing; never delete a task/chat.
                 s.db.execute('UPDATE videos SET missing=1 WHERE channel_id=? AND seen<>?',(cid,stamp))
                 s.db.execute("UPDATE videos SET state='deferred',reason='source_missing',deferral_policy='inventory',owner=NULL WHERE channel_id=? AND missing=1 AND state='pending'",(cid,))
-    return {'channel_id':cid,'complete':complete,'tabs':results}
+    if not complete:
+        date_coverage = 'partial'
+    else:
+        scopes = [item.get('scope') for item in results if item.get('status') == 'ok']
+        if scopes and all(scope == 'full' for scope in scopes):
+            date_coverage = 'full'
+        elif 'full' in scopes:
+            date_coverage = 'mixed'
+        else:
+            date_coverage = 'recent-window'
+    return {'channel_id':cid,'complete':complete,'tabs':results,
+            'date_coverage':date_coverage,'excluded_tabs':['shorts']}
 
 def metadata(s,run,cid,vid,fetch=extract,force=False):
     # Check before doing any network call, then again under the mutation lock.
@@ -1324,7 +1355,7 @@ def main(argv=None):
     a.add_argument('--limit-type',choices=['temporary_rate_limit','usage_exhausted','high_traffic','captcha','login_required','robot_suspected','service_error','unknown'])
     a.add_argument('--reset-at',help='Visible Gemini reset time in ISO-8601 including timezone')
     a = sub.add_parser('resume'); a.add_argument('--confirmed',action='store_true',required=True); a.add_argument('--channel')
-    a = sub.add_parser('adopt-unknown'); a.add_argument('--channel',required=True); a.add_argument('--evidence',required=True)
+    a = sub.add_parser('adopt-unknown'); a.add_argument('--channel',required=True); a.add_argument('--evidence',required=True); a.add_argument('--run',help='Current channel run holding the lease')
     args = p.parse_args(argv)
     s = None
     try:
@@ -1341,7 +1372,10 @@ def main(argv=None):
             elif args.operation=='resume':
                 if not args.confirmed: raise Stop('Explicit recovery confirmation required')
                 with s.tx():
-                    s.db.execute('UPDATE metadata_access SET blocked=NULL WHERE id=1')
+                    access=s.db.execute('SELECT blocked,blocked_until FROM metadata_access WHERE id=1').fetchone()
+                    if access and access['blocked']=='quota_exhausted' and access['blocked_until']>time.time():
+                        raise Stop('YouTube metadata quota has not reset yet')
+                    s.db.execute('UPDATE metadata_access SET blocked=NULL,blocked_until=0,next_at=0 WHERE id=1')
                     if args.job:
                         s.db.execute("UPDATE metadata_jobs SET status='ready' WHERE id=? AND status='review'",(args.job,))
                 result={'metadata_resumed':True,'job':args.job}
@@ -1372,7 +1406,7 @@ def main(argv=None):
         elif args.cmd=='finalize': result=s.finalize(args.run)
         elif args.cmd=='cleanup': result=s.cleanup(args.run)
         elif args.cmd=='handoff': result=s.handoff(args.run)
-        elif args.cmd=='adopt-unknown': result=s.adopt_unknown(args.channel,args.evidence)
+        elif args.cmd=='adopt-unknown': result=s.adopt_unknown(args.channel,args.evidence,args.run)
         elif args.cmd=='park': s.park(args.run); result={'parked':True}
         elif args.cmd=='end': s.end(args.run); result={'ended':True}
         elif args.cmd=='renew':

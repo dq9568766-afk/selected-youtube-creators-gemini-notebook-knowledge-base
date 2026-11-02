@@ -100,3 +100,11 @@ class ChannelLeaseTests(unittest.TestCase):
         result = ytg.main(['--db', str(self.path), 'resume', '--confirmed', '--channel', 'a'])
         self.assertEqual(result, 0)
         self.s.check_lease(b)
+
+    def test_adopt_unknown_allows_own_lease_and_ignores_other_channel(self):
+        self.s.insert('a', {'id': 'vid-a-00001', 'title': '待核视频', 'upload_date': '20261030'}, 'scan', True)
+        self.s.db.execute("UPDATE videos SET state='uncertain', reason='unknown_submit' WHERE channel_id='a' AND id='vid-a-00001'")
+        run = self.s.begin('history', channel_id='a', policy='collect-first')['id']
+        self.s.begin('history', channel_id='b')
+        result = self.s.adopt_unknown('a', 'notebook-identity-checked', run)
+        self.assertEqual(result, {'adopted': 1})

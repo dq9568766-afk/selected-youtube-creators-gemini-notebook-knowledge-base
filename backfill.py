@@ -8,6 +8,12 @@ import urllib.request
 import urllib.error
 import uuid
 
+METADATA_INTERVAL_ENV = 'YOUTUBE_METADATA_INTERVAL_SECONDS'
+DEFAULT_METADATA_INTERVAL = 1.0
+MAX_BATCH_SIZE = 50
+MAX_API_RETRIES = 5
+MAX_BACKOFF_SECONDS = 60
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata_jobs(id TEXT PRIMARY KEY,channel_id TEXT NOT NULL,
  created REAL NOT NULL,status TEXT NOT NULL DEFAULT 'ready');
@@ -16,7 +22,9 @@ CREATE TABLE IF NOT EXISTS metadata_items(job TEXT NOT NULL,video TEXT NOT NULL,
  checked REAL,attempts INTEGER NOT NULL DEFAULT 0,retry_after REAL NOT NULL DEFAULT 0,
  PRIMARY KEY(job,video));
 CREATE TABLE IF NOT EXISTS metadata_access(id INTEGER PRIMARY KEY CHECK(id=1),
- next_at REAL NOT NULL DEFAULT 0,count INTEGER NOT NULL DEFAULT 0,blocked TEXT);
+ next_at REAL NOT NULL DEFAULT 0,count INTEGER NOT NULL DEFAULT 0,blocked TEXT,
+ interval REAL NOT NULL DEFAULT 1,consecutive_success INTEGER NOT NULL DEFAULT 0,
+ blocked_until REAL NOT NULL DEFAULT 0);
 INSERT OR IGNORE INTO metadata_access(id) VALUES(1);
 """
 
@@ -27,19 +35,72 @@ def migrate(s):
             s.db.execute('ALTER TABLE metadata_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0')
         if 'retry_after' not in columns:
             s.db.execute('ALTER TABLE metadata_items ADD COLUMN retry_after REAL NOT NULL DEFAULT 0')
+        access_columns={x['name'] for x in s.db.execute('PRAGMA table_info(metadata_access)')}
+        for name, declaration in [('interval','REAL NOT NULL DEFAULT 1'),
+                                  ('consecutive_success','INTEGER NOT NULL DEFAULT 0'),
+                                  ('blocked_until','REAL NOT NULL DEFAULT 0')]:
+            if name not in access_columns:
+                s.db.execute(f'ALTER TABLE metadata_access ADD COLUMN {name} {declaration}')
+
+def configured_interval():
+    try:
+        return max(0.0, float(os.environ.get(METADATA_INTERVAL_ENV, DEFAULT_METADATA_INTERVAL)))
+    except ValueError:
+        return DEFAULT_METADATA_INTERVAL
 
 def gate(s):
     from ytg import Stop
     with s.tx():
         row=s.db.execute('SELECT * FROM metadata_access WHERE id=1').fetchone()
-        if row['blocked']:
+        now=time.time()
+        if row['blocked'] and row['blocked_until'] > now:
             raise Stop('YouTube metadata paused: '+row['blocked'])
+        if row['blocked']:
+            s.db.execute('UPDATE metadata_access SET blocked=NULL,blocked_until=0 WHERE id=1')
+            row=s.db.execute('SELECT * FROM metadata_access WHERE id=1').fetchone()
         wait=math.ceil(row['next_at']-time.time())
         if wait>0:
             raise Stop('metadata_wait:'+str(wait))
         count=row['count']+1
+        interval=max(configured_interval(), float(row['interval'] or 0))
         s.db.execute('UPDATE metadata_access SET count=?,next_at=? WHERE id=1',
-                     (count,time.time()+(300 if count%50==0 else 10)))
+                     (count,time.time()+interval))
+
+def record_api_success(s):
+    with s.tx():
+        row=s.db.execute('SELECT interval,consecutive_success FROM metadata_access WHERE id=1').fetchone()
+        base=configured_interval()
+        successes=int(row['consecutive_success'] or 0)+1
+        # Recover gradually after a stable response stream; never go below config.
+        interval=max(base, float(row['interval'] or base) * (0.8 if successes >= 3 else 1.0))
+        s.db.execute('UPDATE metadata_access SET interval=?,consecutive_success=? WHERE id=1',
+                     (interval,successes))
+
+def record_rate_limit(s, retry_after=None):
+    with s.tx():
+        row=s.db.execute('SELECT interval,consecutive_success FROM metadata_access WHERE id=1').fetchone()
+        interval=max(configured_interval(), float(row['interval'] or configured_interval()))
+        interval=min(MAX_BACKOFF_SECONDS, max(configured_interval(), interval * 2))
+        delay=max(interval, float(retry_after or 0))
+        s.db.execute('''UPDATE metadata_access
+                        SET interval=?,consecutive_success=0,next_at=?,blocked='temporary_rate_limit',blocked_until=?''',
+                     (interval,time.time()+delay,time.time()+delay))
+    return delay
+
+def quota_reset_timestamp():
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    pacific=ZoneInfo('America/Los_Angeles')
+    now=datetime.now(timezone.utc).astimezone(pacific)
+    tomorrow=(now+timedelta(days=1)).date()
+    return datetime.combine(tomorrow, datetime.min.time(), tzinfo=pacific).timestamp()
+
+def record_quota_exhausted(s):
+    reset=quota_reset_timestamp()
+    with s.tx():
+        s.db.execute("UPDATE metadata_access SET blocked='quota_exhausted',blocked_until=?,next_at=? WHERE id=1",
+                     (reset,reset))
+    return reset
 
 def fetch(s,url,flat=False,limit=None,extractor=None):
     from ytg import extract,metadata_failure,MetadataFailure,Stop
@@ -52,20 +113,14 @@ def fetch(s,url,flat=False,limit=None,extractor=None):
             time.sleep(min(30,int(str(exc).split(':')[1])))
     try:
         key = os.environ.get('YOUTUBE_DATA_API_KEY')
-        if key and not flat:
+        if key and not flat and extractor is None:
             parsed = urllib.parse.urlparse(url)
             video = urllib.parse.parse_qs(parsed.query).get('v', [None])[0]
             if not video:
                 raise ValueError('YouTube URL has no video ID')
-            api_url = 'https://www.googleapis.com/youtube/v3/videos?' + urllib.parse.urlencode({
-                'part': 'snippet', 'id': video, 'key': key,
-            })
-            with urllib.request.urlopen(api_url, timeout=30) as response:
-                payload = json.loads(response.read().decode('utf-8'))
-            items = payload.get('items') or []
-            if not items:
+            item = api_batch(s, [video]).get(video)
+            if not item:
                 raise ValueError('YouTube Data API returned no item')
-            item = items[0]
             snippet = item.get('snippet') or {}
             published = snippet.get('publishedAt') or ''
             return {
@@ -149,31 +204,64 @@ def report(s,job):
 
 def api_batch(s, ids):
     """Fetch up to 50 videos with one official YouTube Data API request."""
-    from ytg import Stop
+    from ytg import Stop, MetadataFailure
     key = os.environ.get('YOUTUBE_DATA_API_KEY')
     if not key or not ids:
         raise Stop('YOUTUBE_DATA_API_KEY is required for API batch mode')
-    while True:
-        try:
-            gate(s)
-            break
-        except Stop as exc:
-            if not str(exc).startswith('metadata_wait:'):
-                raise
-            time.sleep(min(30, int(str(exc).split(':')[1])))
+    ids=list(dict.fromkeys(ids))
+    if len(ids)>MAX_BATCH_SIZE:
+        raise ValueError('YouTube Data API batch is limited to 50 video IDs')
     api_url = 'https://www.googleapis.com/youtube/v3/videos?' + urllib.parse.urlencode({
         'part': 'snippet', 'id': ','.join(ids), 'key': key,
     })
-    try:
-        with urllib.request.urlopen(api_url, timeout=30) as response:
-            payload = json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403, 429}:
-            with s.tx():
-                s.db.execute('UPDATE metadata_access SET blocked=? WHERE id=1',
-                             ('youtube_api_http_'+str(exc.code),))
-        raise
-    return {item.get('id'): item for item in payload.get('items', [])}
+    for attempt in range(MAX_API_RETRIES):
+        while True:
+            try:
+                gate(s)
+                break
+            except Stop as exc:
+                if not str(exc).startswith('metadata_wait:'):
+                    raise
+                time.sleep(min(30, int(str(exc).split(':')[1])))
+        try:
+            with urllib.request.urlopen(api_url, timeout=30) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            error=payload.get('error') or {}
+            if error:
+                reasons=' '.join(str(e.get('reason','')) for e in error.get('errors',[])).lower()
+                message=(error.get('message') or '').lower()
+                if any(x in reasons+' '+message for x in ('quotaexceeded','dailylimitexceeded','dailylimit')):
+                    reset=record_quota_exhausted(s)
+                    raise MetadataFailure('youtube_api_quota_exhausted:'+str(int(reset)))
+                if int(error.get('code',500)) in {429,503}:
+                    raise urllib.error.HTTPError(api_url, int(error.get('code',500)),
+                                                 'YouTube API error', None, None)
+                raise MetadataFailure('youtube_api_http_'+str(error.get('code',500)))
+            record_api_success(s)
+            return {item.get('id'): item for item in payload.get('items', [])}
+        except urllib.error.HTTPError as exc:
+            body=''
+            try:
+                body=exc.read().decode('utf-8','ignore').lower()
+            except Exception:
+                pass
+            if exc.code==403 and any(x in body for x in ('quotaexceeded','dailylimitexceeded','dailylimit')):
+                reset=record_quota_exhausted(s)
+                raise MetadataFailure('youtube_api_quota_exhausted:'+str(int(reset))) from exc
+            if exc.code==429 or exc.code==503:
+                retry_after=None
+                try: retry_after=float(exc.headers.get('Retry-After')) if exc.headers else None
+                except (TypeError,ValueError): pass
+                delay=record_rate_limit(s,retry_after)
+                if attempt+1<MAX_API_RETRIES:
+                    time.sleep(delay)
+                    continue
+                raise MetadataFailure('youtube_rate_limited') from exc
+            if exc.code in {401,403}:
+                with s.tx():
+                    s.db.execute('UPDATE metadata_access SET blocked=? WHERE id=1',
+                                 ('youtube_api_http_'+str(exc.code),))
+            raise
 
 def batch_step(s,job):
     """Process a maximum API page of 50 pending IDs in one transaction."""
@@ -222,6 +310,14 @@ def batch_step(s,job):
                                  (date,checked,snippet.get('title') or '',cid,vid))
         return {'job':job,'state':'batch_complete','count':len(ids),'matched':len(items)}
     except Exception as exc:
+        category = str(exc)
+        if category in {'youtube_rate_limited', 'youtube_auth_required', 'metadata_network_error'} or category.startswith('youtube_api_quota_exhausted'):
+            reason = 'quota_exhausted' if category.startswith('youtube_api_quota_exhausted') else category
+            with s.tx():
+                for vid in ids:
+                    s.db.execute("UPDATE metadata_items SET state='pending',reason=? WHERE job=? AND video=?",
+                                 (reason,job,vid))
+            raise
         with s.tx():
             for vid in ids:
                 attempts=s.db.execute('SELECT attempts FROM metadata_items WHERE job=? AND video=?',(job,vid)).fetchone()[0]+1

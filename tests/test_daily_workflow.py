@@ -114,6 +114,39 @@ class DailyWorkflowTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 2)
             self.assertNotIn('skipped', result)
 
+    def test_recent_window_expands_when_date_boundary_is_not_reached(self):
+        boundary = {'id': 'aaaaaaaaaaa', 'title': '边界视频', 'upload_date': '20261030'}
+        first = lambda url, *a, **k: {
+            'channel_id': CID,
+            'entries': [boundary] if url.endswith('/videos') else [],
+        }
+        ytg.scan(self.s, CID, fetch=first)
+        calls = []
+        new = {'id': 'bbbbbbbbbbb', 'title': '新视频', 'upload_date': '20261031'}
+
+        def second(url, *args, **kwargs):
+            calls.append((url, kwargs.get('limit')))
+            if url.endswith('/videos') and kwargs.get('limit') == ytg.SCAN_WINDOW:
+                return {'channel_id': CID, 'entries': [new]}
+            if url.endswith('/videos'):
+                return {'channel_id': CID, 'entries': [new, boundary]}
+            return {'channel_id': CID, 'entries': []}
+
+        with patch('ytg.now', return_value=datetime(2026, 10, 31, 12)):
+            result = ytg.scan(self.s, CID, fetch=second)
+
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['date_coverage'], 'mixed')
+        self.assertEqual(result['tabs'][0]['scope'], 'full')
+        self.assertIn(('https://www.youtube.com/@fixture/videos', None), calls)
+        self.assertEqual(self.s.video(CID, new['id'])['history'], 0)
+
+    def test_scan_result_separates_completion_from_date_coverage(self):
+        result = ytg.scan(self.s, CID, fetch=self.fetch)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['date_coverage'], 'recent-window')
+        self.assertEqual(result['excluded_tabs'], ['shorts'])
+
     def test_initial_partial_scan_is_frozen_and_committed_once(self):
         self.s.db.execute('UPDATE channels SET initialized=0')
         old = {'id': 'aaaaaaaaaaa', 'title': '旧视频', 'upload_date': '20261029'}

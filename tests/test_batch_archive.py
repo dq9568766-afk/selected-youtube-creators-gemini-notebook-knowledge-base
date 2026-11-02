@@ -108,11 +108,11 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.assertIsNone(self.s.db.execute("SELECT break_started FROM pacing WHERE scope='gemini-account'").fetchone()[0])
         self.tick.return_value=10060.
         result=ytg.advance(self.s,self.run,CID,item['id'],'verify',item['expected_title'],ytg.CURRENT_PAGE_EVIDENCE)
-        self.assertEqual(result['next'],{'stop':'break_required','seconds_remaining':120})
+        self.assertEqual(result['next'],{'stop':'break_required','seconds_remaining':90})
         self.assertEqual(self.count(),20)
-        self.tick.return_value=10179.
+        self.tick.return_value=10149.
         self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],1)
-        self.tick.return_value=10180.
+        self.tick.return_value=10150.
         self.assertEqual(ytg.prepare(self.s,self.run)['state'],'reserved')
         self.assertEqual(self.count(),0)
 
@@ -147,12 +147,12 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.s.db.close()
         self.s=ytg.Store(self.path)
         self.run=self.s.begin('history',channel_id=CID,run_id=self.run)['id']
-        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],120)
+        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],90)
         self.s.cleanup(self.run)
         self.s.insert(CID,{'id':'99999999999','title':'fixture','upload_date':'20261026'},'scan',False)
         self.run=self.s.begin('incremental',channel_id=CID)['id']
-        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],120)
-        self.tick.return_value=10120.
+        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],90)
+        self.tick.return_value=10090.
         self.assertEqual(ytg.prepare(self.s,self.run,lambda *a: {'id':'99999999999','channel_id':CID,'title':'fixture','upload_date':'20261026'})['state'],'reserved')
 
     def test_cleanup_and_same_run_reopen_require_reopened_evidence(self):
@@ -221,7 +221,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.assertEqual(self.count(),10)
         self.assertEqual(ytg.prepare(self.s,self.run)['state'],'reserved')
 
-    def test_unknown_legacy_counter_requires_120_seconds_without_resetting_work(self):
+    def test_unknown_legacy_counter_requires_90_seconds_without_resetting_work(self):
         item=self.generate()
         self.s.db.execute('DROP TABLE pacing')
         self.s.db.execute('ALTER TABLE runs DROP COLUMN batch_count')
@@ -230,8 +230,8 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.s.db.close()
         self.s=ytg.Store(self.path)
         self.archive(self.s.finalize(self.run),'reopen-video-summary')
-        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],120)
-        self.tick.return_value=10120.
+        self.assertEqual(ytg.prepare(self.s,self.run)['seconds_remaining'],90)
+        self.tick.return_value=10090.
         self.assertEqual(ytg.prepare(self.s,self.run)['state'],'reserved')
         self.assertEqual(self.s.video(CID,item['id'])['chat'],item['chat'])
 

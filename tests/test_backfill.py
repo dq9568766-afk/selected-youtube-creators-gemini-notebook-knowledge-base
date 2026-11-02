@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+import time
 import test_efficiency as fixtures
 from test_efficiency import CID, VID
 import ytg
@@ -44,6 +45,22 @@ class BackfillTests(unittest.TestCase):
         with self.assertRaisesRegex(ytg.Stop,'metadata_wait'): backfill.gate(self.s)
         self.s.begin('history',channel_id=CID)
         with self.assertRaisesRegex(ytg.Stop,'Another worker'): backfill.step(self.s,job)
+
+    def test_metadata_interval_is_configurable_without_every_fiftieth_pause(self):
+        with patch.dict('os.environ', {backfill.METADATA_INTERVAL_ENV: '1'}, clear=False):
+            backfill.gate(self.s)
+            row=self.s.db.execute('SELECT next_at,count FROM metadata_access').fetchone()
+            self.s.db.execute('UPDATE metadata_access SET count=49,next_at=0')
+            before=time.time()
+            backfill.gate(self.s)
+            row=self.s.db.execute('SELECT next_at,count FROM metadata_access').fetchone()
+        self.assertEqual(row['count'],50)
+        self.assertLess(row['next_at']-before,5)
+
+    def test_api_batch_rejects_more_than_fifty_ids(self):
+        with patch.dict('os.environ', {'YOUTUBE_DATA_API_KEY':'test-key'}, clear=False):
+            with self.assertRaisesRegex(ValueError,'50'):
+                backfill.api_batch(self.s, [f'{i:011d}' for i in range(51)])
 
     def test_unavailable_is_not_all_dates_complete(self):
         job=self.job()

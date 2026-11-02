@@ -140,7 +140,7 @@ class QueueTests(unittest.TestCase):
         for i in range(22):
             if i==20:
                 self.assertEqual(self.s.reserve(run)['stop'],'break_required')
-                self.s.db.execute('UPDATE pacing SET break_started=?',(time.time()-120,))
+                self.s.db.execute('UPDATE pacing SET break_started=?',(time.time()-ytg.BREAK_SECONDS,))
             item=self.s.reserve(run)
             self.assertEqual(item['state'],'reserved')
             vid=item['id']
