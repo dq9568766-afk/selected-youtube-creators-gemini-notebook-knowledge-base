@@ -1,0 +1,29 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+   chat TEXT UNIQUE, topic TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
++  title_source TEXT,
+   PRIMARY KEY(channel_id,id));
+@@
+ def metadata_fresh(row):
+     # Wang titles include the verified publication date. Do not arm a task
+     # whose target title cannot be computed without guessing that date.
+     if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
+         return False
++    # A channel listing can serve an auto-translated title instead of the
++    # original video title. Only the official API confirms the original.
++    if os.environ.get('YOUTUBE_DATA_API_KEY'):
++        return row['title_source']=='api' and bool(row['title'].strip()) and row['title'] != row['id']
+     return bool(row['title'].strip()) and row['title'] != row['id']
+@@
+         if 'metadata_checked' not in columns:
+             with self.tx():
+                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
+                 if 'metadata_checked' not in columns:
+                     self.db.execute('ALTER TABLE videos ADD COLUMN metadata_checked REAL')
++        if 'title_source' not in columns:
++            with self.tx():
++                columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
++                if 'title_source' not in columns:
++                    self.db.execute('ALTER TABLE videos ADD COLUMN title_source TEXT')
+*** End Patch

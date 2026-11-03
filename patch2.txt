@@ -1,0 +1,17 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+         self.db.execute('''INSERT INTO videos(channel_id,id,title,published,history,found,seen)
+           VALUES(?,?,?,?,?,?,?) ON CONFLICT(channel_id,id) DO UPDATE SET
+           seen=excluded.seen,missing=0,
+-          metadata_checked=CASE WHEN videos.state='pending' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
+-          title=CASE WHEN videos.state='pending' THEN excluded.title ELSE videos.title END,
++          metadata_checked=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
++          title=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' THEN excluded.title ELSE videos.title END,
++          title_source=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' THEN NULL ELSE videos.title_source END,
+           published=CASE WHEN videos.state='pending' AND excluded.published IS NOT NULL THEN excluded.published ELSE videos.published END,
+@@
+-        if title.strip() and title != vid:
++        if title.strip() and title != vid and not os.environ.get('YOUTUBE_DATA_API_KEY'):
+             self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
+*** End Patch

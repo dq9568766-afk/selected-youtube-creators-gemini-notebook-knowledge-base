@@ -1,0 +1,22 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@ CREATE TABLE IF NOT EXISTS videos(
+   channel_id TEXT NOT NULL REFERENCES channels(id), id TEXT NOT NULL,
+   title TEXT NOT NULL, published TEXT, history INTEGER NOT NULL,
+   found INTEGER NOT NULL, seen TEXT NOT NULL, missing INTEGER NOT NULL DEFAULT 0,
+   state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
+   ('pending','reserved','submitting','submitted','summarized','renamed','verified','uncertain','blocked','deferred')),
+   chat TEXT UNIQUE, topic TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
++  title_source TEXT,
+   PRIMARY KEY(channel_id,id));
+@@ def metadata_fresh(row):
+     # Wang titles include the verified publication date. Do not arm a task
+     # whose target title cannot be computed without guessing that date.
+     if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
+         return False
++    # A channel listing can serve an auto-translated title instead of the
++    # original video title. Only the official API confirms the original.
++    if os.environ.get('YOUTUBE_DATA_API_KEY'):
++        return row['title_source']=='api' and bool(row['title'].strip()) and row['title'] != row['id']
+     return bool(row['title'].strip()) and row['title'] != row['id']
+*** End Patch

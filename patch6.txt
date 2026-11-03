@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
++    a = sub.add_parser('title-refresh'); a.add_argument('channel'); a.add_argument('--limit',type=int)
+@@
+         elif args.cmd=='metadata': result=metadata(s,args.run,args.channel,args.video,force=args.force)
++        elif args.cmd=='title-refresh': result=title_refresh(s,args.channel,args.limit)
+*** End Patch

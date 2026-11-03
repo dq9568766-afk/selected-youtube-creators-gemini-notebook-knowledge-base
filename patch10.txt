@@ -1,0 +1,16 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+ CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
++API_TITLE_CHANNELS = {'UCBKDRq35-L8xev4O7ZqBeLg','UC8UCbiPrm2zN9nZHKdTevZA'}
+@@
+ def metadata_fresh(row):
+@@
+-    if os.environ.get('YOUTUBE_DATA_API_KEY'):
++    if row['channel_id'] in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+         return row['title_source']=='api' and bool(row['title'].strip()) and row['title'] != row['id']
+@@
+-    if os.environ.get('YOUTUBE_DATA_API_KEY'):
++    if cid in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+         return api_metadata(s,run,cid,vid)
+*** End Patch

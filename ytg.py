@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS videos(
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
  ('pending','reserved','submitting','submitted','summarized','renamed','verified','uncertain','blocked','deferred')),
  chat TEXT UNIQUE, topic TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
+  title_source TEXT,
  PRIMARY KEY(channel_id,id));
 CREATE INDEX IF NOT EXISTS videos_owner_state ON videos(owner,state,found);
 CREATE INDEX IF NOT EXISTS videos_queue ON videos(history,state,found);
@@ -93,6 +94,7 @@ ACCOUNT_COORDINATOR_HOLD = 15
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
 CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
+API_TITLE_CHANNELS = {'UCBKDRq35-L8xev4O7ZqBeLg','UC8UCbiPrm2zN9nZHKdTevZA'}
 COLLECT_REASONS = {'generation_timeout','submission_unconfirmed','chat_unidentified','content_failed','archive_unverified','source_unavailable','metadata_unavailable','live_not_ready'}
 
 class Stop(Exception):
@@ -151,6 +153,10 @@ def metadata_fresh(row):
     # whose target title cannot be computed without guessing that date.
     if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
         return False
+    # A channel listing can serve an auto-translated title instead of the
+    # original video title. Only the official API confirms the original.
+    if row['channel_id'] in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+        return row['title_source']=='api' and bool(row['title'].strip()) and row['title'] != row['id']
     return bool(row['title'].strip()) and row['title'] != row['id']
 
 def inventory_date(entry):
@@ -215,6 +221,11 @@ class Store:
                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
                 if 'metadata_checked' not in columns:
                     self.db.execute('ALTER TABLE videos ADD COLUMN metadata_checked REAL')
+        if 'title_source' not in columns:
+            with self.tx():
+                columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
+                if 'title_source' not in columns:
+                    self.db.execute('ALTER TABLE videos ADD COLUMN title_source TEXT')
         run_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
         with self.tx():
             for name, declaration in [('scan_stamp','TEXT'), ('outcome','TEXT'), ('parent_run','TEXT')]:
@@ -504,14 +515,15 @@ class Store:
         self.db.execute('''INSERT INTO videos(channel_id,id,title,published,history,found,seen)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(channel_id,id) DO UPDATE SET
           seen=excluded.seen,missing=0,
-          metadata_checked=CASE WHEN videos.state='pending' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
-          title=CASE WHEN videos.state='pending' THEN excluded.title ELSE videos.title END,
+          metadata_checked=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' AND videos.title<>excluded.title THEN NULL ELSE videos.metadata_checked END,
+          title=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' THEN excluded.title ELSE videos.title END,
+          title_source=CASE WHEN videos.state='pending' AND COALESCE(videos.title_source,'')<>'api' THEN NULL ELSE videos.title_source END,
           published=CASE WHEN videos.state='pending' AND excluded.published IS NOT NULL THEN excluded.published ELSE videos.published END,
           processed_counted=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 0 ELSE videos.processed_counted END,
           state=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 'pending' ELSE videos.state END,
           reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN NULL ELSE videos.reason END''',
           (cid,vid,title,published,int(history),time.time_ns(),stamp))
-        if title.strip() and title != vid:
+        if title.strip() and title != vid and not os.environ.get('YOUTUBE_DATA_API_KEY'):
             self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
 
 
@@ -1244,6 +1256,41 @@ def scan(s,cid,full=False,fetch=extract,run=None):
     return {'channel_id':cid,'complete':complete,'tabs':results,
             'date_coverage':date_coverage,'excluded_tabs':['shorts']}
 
+def api_metadata(s,run,cid,vid):
+    """Resolve the original title and publication date from the official Data API."""
+    import backfill
+    try:
+        items = backfill.api_batch(s,[vid])
+    except (Stop,MetadataFailure):
+        raise
+    except Exception as exc:
+        raise MetadataFailure(metadata_failure(exc)) from exc
+    item = items.get(vid)
+    if not item:
+        return s.transition(run,cid,vid,'defer','metadata_unavailable')
+    snippet = item.get('snippet') or {}
+    if snippet.get('channelId') and snippet['channelId']!=cid:
+        raise Stop('Video/channel identity mismatch')
+    if snippet.get('liveBroadcastContent') in {'live','upcoming'}:
+        return s.transition(run,cid,vid,'defer','live_not_ready')
+    title = (snippet.get('title') or '').strip()
+    if not title:
+        raise Stop('Metadata did not return an original title')
+    published = (snippet.get('publishedAt') or '')[:10].replace('-','')
+    date = None
+    if published:
+        try:
+            date = date_value(published)
+        except (Stop,TypeError):
+            date = None
+    with s.tx():
+        s.check_lease(run)
+        result = s.db.execute("UPDATE videos SET title=?,published=COALESCE(published,?),metadata_checked=?,title_source='api' WHERE channel_id=? AND id=? AND state='reserved' AND owner=?",
+                              (title,date,time.time(),cid,vid,run))
+        if result.rowcount!=1:
+            raise Stop('Reservation changed during metadata lookup')
+    return s.payload(s.video(cid,vid))
+
 def metadata(s,run,cid,vid,fetch=extract,force=False):
     # Check before doing any network call, then again under the mutation lock.
     with s.tx():
@@ -1253,6 +1300,8 @@ def metadata(s,run,cid,vid,fetch=extract,force=False):
             raise Stop('Metadata update only allowed for the current reserved item')
         if not force and metadata_fresh(v):
             return s.payload(v)
+    if cid in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+        return api_metadata(s,run,cid,vid)
     try:
         import backfill
         info = backfill.fetch(s,'https://www.youtube.com/watch?v='+vid,extractor=fetch) if fetch is extract else fetch('https://www.youtube.com/watch?v='+vid,False)
@@ -1332,6 +1381,36 @@ def advance(s,run,cid,vid,action,value,evidence,fetch=extract):
         following = {'stopped':str(exc)}
     return {'completed':compact(completed,ack=True),'next':compact(following)}
 
+def title_refresh(s,cid,limit=None,states=None):
+    """Correct stored titles to the original YouTube titles through the official API."""
+    import backfill
+    s.channel(cid)
+    wanted = [x.strip() for x in (states or 'pending,deferred,verified,renamed,summarized').split(',') if x.strip()]
+    rows = s.db.execute("SELECT id,title,title_source,published,state,chat FROM videos WHERE channel_id=? AND state IN (%s) ORDER BY (published IS NULL) DESC, published DESC, id" % ','.join('?'*len(wanted)),(cid,*wanted)).fetchall()
+    if limit:
+        rows = rows[:limit]
+    by_id = {r['id']: r for r in rows}
+    ids = list(by_id)
+    changed = []; missing = []; mismatch = []
+    for start in range(0,len(ids),50):
+        batch = ids[start:start+50]
+        items = backfill.api_batch(s,batch)
+        for vid in batch:
+            item = items.get(vid)
+            snippet = (item or {}).get('snippet') or {}
+            title = (snippet.get('title') or '').strip()
+            if not item or not title:
+                missing.append(vid); continue
+            if snippet.get('channelId') and snippet['channelId']!=cid:
+                mismatch.append(vid); continue
+            published = (snippet.get('publishedAt') or '')[:10].replace('-','')
+            row = by_id[vid]
+            if row['title']!=title or row['title_source']!='api' or not row['published']:
+                with s.tx():
+                    s.db.execute("UPDATE videos SET title=?,title_source='api',published=COALESCE(published,?) WHERE channel_id=? AND id=?",(title,published or None,cid,vid))
+                changed.append(vid)
+    return {'channel_id':cid,'total':len(ids),'changed':len(changed),'missing':len(missing),'mismatch':len(mismatch),'changed_ids':changed[:80],'missing_ids':missing[:80],'mismatch_ids':mismatch[:80]}
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--db',default=str(default_db_path()))
@@ -1348,6 +1427,7 @@ def main(argv=None):
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
+    a = sub.add_parser('title-refresh'); a.add_argument('channel'); a.add_argument('--limit',type=int); a.add_argument('--states',help='Comma separated states to correct, default pending,deferred')
     a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','retitle','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
     a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history'); a.add_argument('--channel')
     a = sub.add_parser('gemini-limit-report'); a.add_argument('--channel')
@@ -1413,6 +1493,7 @@ def main(argv=None):
             with s.tx(): s.check_lease(args.run)
             result={'renewed':True}
         elif args.cmd=='metadata': result=metadata(s,args.run,args.channel,args.video,force=args.force)
+        elif args.cmd=='title-refresh': result=title_refresh(s,args.channel,args.limit,args.states)
         elif args.cmd=='step':
             if args.advance:
                 result=advance(s,args.run,args.channel,args.video,args.action,args.value,args.evidence)

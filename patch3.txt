@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+ def metadata(s,run,cid,vid,fetch=extract,force=False):
+@@
+         if not force and metadata_fresh(v):
+             return s.payload(v)
++    if os.environ.get('YOUTUBE_DATA_API_KEY'):
++        return api_metadata(s,run,cid,vid)
+     try:
+*** End Patch

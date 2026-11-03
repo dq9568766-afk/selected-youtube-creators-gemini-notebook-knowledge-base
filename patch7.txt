@@ -1,0 +1,18 @@
+*** Begin Patch
+*** Update File: ytg.py
+@@
+-def title_refresh(s,cid,limit=None):
++def title_refresh(s,cid,limit=None,states=None):
+     """Correct stored titles to the original YouTube titles through the official API."""
+     import backfill
+     s.channel(cid)
+-    rows = s.db.execute("SELECT id,title,title_source,published,state,chat FROM videos WHERE channel_id=? AND state NOT IN ('reserved','submitting','submitted','summarized','renamed','uncertain') ORDER BY (published IS NULL) DESC, published DESC, id",(cid,)).fetchall()
++    wanted = [x.strip() for x in (states or 'pending,deferred').split(',') if x.strip()]
++    rows = s.db.execute("SELECT id,title,title_source,published,state,chat FROM videos WHERE channel_id=? AND state IN (%s) ORDER BY (published IS NULL) DESC, published DESC, id" % ','.join('?'*len(wanted)),(cid,*wanted)).fetchall()
+@@
+-    a = sub.add_parser('title-refresh'); a.add_argument('channel'); a.add_argument('--limit',type=int)
++    a = sub.add_parser('title-refresh'); a.add_argument('channel'); a.add_argument('--limit',type=int); a.add_argument('--states',help='Comma separated states to correct, default pending,deferred')
+@@
+-        elif args.cmd=='title-refresh': result=title_refresh(s,args.channel,args.limit)
++        elif args.cmd=='title-refresh': result=title_refresh(s,args.channel,args.limit,args.states)
+*** End Patch
