@@ -53,6 +53,14 @@ https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowl
 
 仓库已带 [SKILL.md](SKILL.md)，创建技能时接入完整项目即可，不必重新写一套流程。Codex 的 `$skill-creator` 用法见 [官方说明](https://developers.openai.com/plugins/build/skills)；其他智能体的能力要求见 [适配指南](docs/AGENT_ADAPTERS.md)。
 
+迁移到 WorkBuddy 时，在项目根目录生成专用技能包：
+
+```powershell
+python workbuddy_package.py --output C:\path\to\workbuddy-skill
+```
+
+生成包包含 WorkBuddy 所需的双语元数据、`references/`、`scripts/` 和历史改名扩展；不会复制任务数据库、浏览器登录资料或摘要。WorkBuddy 内置浏览器优先负责 Gemini 生成、发送和核验；由于它不能加载扩展，历史批量改名时才在外部 Windows 浏览器加载本项目扩展。外部浏览器不能替代内置浏览器处理 Gemini 生成或恢复。安装技能不等于 WorkBuddy 已具备可操作的 Gemini 浏览器，仍需通过适配指南中的页面能力检查。
+
 ### ▶️ 装好后，给它一个频道
 
 把示例地址替换成你想整理的频道，再发给智能体：

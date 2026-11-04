@@ -2,6 +2,8 @@
 
 ## 已授权的历史批量改名例外
 
+WorkBuddy 的正常 Gemini 工作固定优先使用 WorkBuddy 内置浏览器。WorkBuddy 内置浏览器不能加载本项目扩展，因此只有历史任务显式选择 `archive_mode=extension` 时，才在外部 Windows 浏览器加载 `extensions/history-renamer`。外部浏览器只做历史聊天改名、重开和网页核验，不得发送总结、快速重试、恢复未知提交或替代 WorkBuddy 内置浏览器的页面能力检查。
+
 新频道首次开始前，必须向用户说明并选择改名方案，按频道记录选择；已有频道沿用已记录方案。方案1（原方案）：Gemini 总结后由 Codex 逐条改名并核验。优点是无需扩展、每条总结后立即核验、流程直接；缺点是每条改名都需 Codex/模型介入，历史积压耗时且消耗模型用量。方案2（扩展批量改名）：总结仍在内置浏览器生成，历史聊天之后由项目扩展控制专用浏览器标签完成打开、切换、改名、重开和核验，不调用模型。优点是历史改名和核验阶段不消耗模型用量，适合历史积压；缺点是需加载扩展和运行本机服务，页面仍逐条操作并受节流和页面稳定性影响。每条异常最多自动重开两次，仍无法确认才保留 pending。每日增量无论频道选择均继续方案1。方案2详细见 [HISTORY_RENAME.md](HISTORY_RENAME.md)。仅显式选择方案2并启用 `archive_mode=extension` 后，才覆盖本规程的即时改名及浏览器限制；旧运行默认 serial，不默默切换。
 
 - 先在内置浏览器核对账号及登记 Gemini Notebook，再按频道配置实际账号，`begin --mode history --channel CHANNEL_ID --archive extension`，或者在当前提交结清后 `history-rename enable RUN`。增量及无频道运行禁止启用。
@@ -25,7 +27,17 @@
 
 ## 开始和恢复
 
-**每次队列处理回合先打开 Codex 内置浏览器。** 不以浏览器工具已可用、侧边已有页面、上轮留下的标签或记忆中的会话代替此步骤。先在当前 Codex 内置浏览器中选定/创建本轮工作标签，并导航到登记的 Gemini Notebook；确认页面内容可读且可完成一次无副作用交互。之后才运行 `status` 并检查暂停、频道及租约，再开始队列操作。恢复也必须重新执行此门槛。具体标签失效处理见 `docs/AGENT_ADAPTERS.md`；不得改用外部 Chrome。页面能力检查失败时按故障范围保留暂停并停止，不运行提交步骤。
+### 首次频道配置
+
+频道的改名方案、标题格式和会员资格必须持久化到 canonical 任务库，不能只依赖当前智能体记忆。确认后运行：
+
+```powershell
+python ytg.py channel-config CHANNEL_ID --rename-strategy RENAME_STRATEGY --title-format TITLE_FORMAT --membership MEMBERSHIP
+```
+
+`original` 表示原标题，`topic` 表示主题分类+原标题，`date-topic` 表示发布日期+主题分类+原标题。缺少配置时，CLI 的 `scan` 和频道范围 `begin` 会停止，不建立新租约。`preflight --channel CHANNEL_ID` 只报告本地状态，不替浏览器证明 Gemini 页面可用。
+
+**每次队列处理回合先打开当前智能体的获准内置浏览器。** 不以浏览器工具已可用、侧边已有页面、上轮留下的标签或记忆中的会话代替此步骤。先在当前智能体的获准内置浏览器中选定/创建本轮工作标签，并导航到登记的 Gemini Notebook；确认页面内容可读且可完成一次无副作用交互。之后才运行 `status` 并检查暂停、频道及租约，再开始队列操作。恢复也必须重新执行此门槛。具体标签失效处理见 `docs/AGENT_ADAPTERS.md`；只有显式启用历史改名扩展时，才按上文例外使用外部 Windows 浏览器。页面能力检查失败时按故障范围保留暂停并停止，不运行提交步骤。
 
 每轮读一次 `status`，恢复时再读一次 `--verbose status` 核对 lease 的 run_id/expires；忙碌不等于后台工作。其他频道的有效租约不构成本频道冲突，也不应导致退出；仅 scope 为本频道或 `*` 的有效租约才阻止开始/接手。其他频道的账号协调槽只会让 `pace access`、`arm` 或 `retry` 返回 `ready:false`，应等待其 `seconds_remaining` 后重试原命令。其他有效租约不抢占。登录、验证码、/sorry、配额及确认的账号/浏览器会话故障是全局阻塞，停止所有网页与队列操作，等待用户明确恢复；单条未知提交、来源不可用、健康检查失败和其他视频级问题按频道记录暂停，其他频道仍可在独立租约和页面证据满足时运行；不重复探测或发送状态消息。
 

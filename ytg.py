@@ -57,7 +57,11 @@ CREATE TABLE IF NOT EXISTS channels(
  id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
  notebook TEXT UNIQUE, initialized INTEGER NOT NULL DEFAULT 0,
  last_full TEXT, last_check TEXT, turn INTEGER NOT NULL DEFAULT 0,
- tracking INTEGER NOT NULL DEFAULT 0);
+ tracking INTEGER NOT NULL DEFAULT 0,
+ rename_strategy TEXT,
+ title_format TEXT,
+ membership_status TEXT,
+ config_confirmed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scans(
  channel_id TEXT NOT NULL REFERENCES channels(id), tab TEXT NOT NULL,
  count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
@@ -96,6 +100,9 @@ REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary'
 CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
 API_TITLE_CHANNELS = {'UCBKDRq35-L8xev4O7ZqBeLg','UC8UCbiPrm2zN9nZHKdTevZA'}
 COLLECT_REASONS = {'generation_timeout','submission_unconfirmed','chat_unidentified','content_failed','archive_unverified','source_unavailable','metadata_unavailable','live_not_ready'}
+RENAME_STRATEGIES = {'serial', 'extension'}
+TITLE_FORMATS = {'original', 'topic', 'date-topic'}
+MEMBERSHIP_STATUSES = {'yes', 'no', 'unknown'}
 
 class Stop(Exception):
     pass
@@ -138,9 +145,19 @@ def date_value(value):
     return value
 
 def title_for(row, topic=None):
+    configured = row['title_format'] if 'title_format' in row.keys() else None
+    if configured == 'original':
+        return row['title']
     topic = topic or row['topic']
     if not topic or not re.fullmatch(r'[\u3400-\u4dbf\u4e00-\u9fff]{1,5}', topic):
         raise Stop('Topic must contain 1–5 Han characters')
+    if configured == 'topic':
+        return f"{topic}-{row['title']}"
+    if configured == 'date-topic':
+        return f"{date_value(row['published'])}-{topic}-{row['title']}"
+
+    # Legacy databases did not persist the user's title choice. Preserve their
+    # previous behavior until the channel is explicitly configured.
     if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg':
         published = date_value(row['published'])
         return f"{published}-{topic}-{row['title']}"
@@ -149,9 +166,13 @@ def title_for(row, topic=None):
 
 
 def metadata_fresh(row):
-    # Wang titles include the verified publication date. Do not arm a task
+    # Date-based titles require a verified publication date. Do not arm a task
     # whose target title cannot be computed without guessing that date.
-    if row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg' and not row['published']:
+    configured = row['title_format'] if 'title_format' in row.keys() else None
+    date_required = configured == 'date-topic' or (
+        not configured and row['channel_id'] == 'UCBKDRq35-L8xev4O7ZqBeLg'
+    )
+    if date_required and not row['published']:
         return False
     # A channel listing can serve an auto-translated title instead of the
     # original video title. Only the official API confirms the original.
@@ -188,8 +209,9 @@ def generation_decision(elapsed, substantive=False, growing=False, complete=Fals
 
 class Store:
     def __init__(self,path):
-        Path(path).parent.mkdir(parents=True,exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+        self.db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         had_pacing = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacing'").fetchone())
@@ -216,6 +238,16 @@ class Store:
                 self.db.execute('ALTER TABLE channels ADD COLUMN tracking INTEGER NOT NULL DEFAULT 0')
                 # A verified first summary opts the channel into daily tracking.
                 self.db.execute("UPDATE channels SET tracking=1 WHERE id IN (SELECT channel_id FROM videos WHERE state='verified')")
+        channel_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(channels)')}
+        with self.tx():
+            for name, declaration in [
+                ('rename_strategy', 'TEXT'),
+                ('title_format', 'TEXT'),
+                ('membership_status', 'TEXT'),
+                ('config_confirmed', 'INTEGER NOT NULL DEFAULT 0'),
+            ]:
+                if name not in channel_columns:
+                    self.db.execute(f'ALTER TABLE channels ADD COLUMN {name} {declaration}')
         if 'metadata_checked' not in columns:
             with self.tx():
                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
@@ -509,8 +541,68 @@ class Store:
             raise Stop('Unknown channel')
         return r
 
+    def channel_config(self, cid):
+        """Return the persisted first-run choices for one channel."""
+        channel = self.channel(cid)
+        complete = bool(
+            channel['config_confirmed']
+            and channel['rename_strategy'] in RENAME_STRATEGIES
+            and channel['title_format'] in TITLE_FORMATS
+            and channel['membership_status'] in MEMBERSHIP_STATUSES
+        )
+        return {
+            'channel_id': cid,
+            'complete': complete,
+            'rename_strategy': channel['rename_strategy'],
+            'title_format': channel['title_format'],
+            'membership_status': channel['membership_status'],
+            'config_confirmed': int(bool(channel['config_confirmed'])),
+        }
+
+    def configure_channel(
+        self,
+        cid,
+        *,
+        rename_strategy=None,
+        title_format=None,
+        membership_status=None,
+    ):
+        """Persist the first-run choices without changing queue state."""
+        for value, allowed, label in (
+            (rename_strategy, RENAME_STRATEGIES, 'rename strategy'),
+            (title_format, TITLE_FORMATS, 'title format'),
+            (membership_status, MEMBERSHIP_STATUSES, 'membership status'),
+        ):
+            if value is not None and value not in allowed:
+                raise Stop(f'Unknown {label}')
+        current = self.channel(cid)
+        values = {
+            'rename_strategy': rename_strategy or current['rename_strategy'],
+            'title_format': title_format or current['title_format'],
+            'membership_status': membership_status or current['membership_status'],
+        }
+        confirmed = int(all(values[name] in allowed for name, allowed in (
+            ('rename_strategy', RENAME_STRATEGIES),
+            ('title_format', TITLE_FORMATS),
+            ('membership_status', MEMBERSHIP_STATUSES),
+        )))
+        with self.tx():
+            self.db.execute(
+                """UPDATE channels
+                   SET rename_strategy=?, title_format=?, membership_status=?,
+                       config_confirmed=?
+                 WHERE id=?""",
+                (values['rename_strategy'], values['title_format'],
+                 values['membership_status'], confirmed, cid),
+            )
+        return self.channel(cid)
+
     def video(self,cid,vid):
-        r = self.db.execute('SELECT * FROM videos WHERE channel_id=? AND id=?',(cid,vid)).fetchone()
+        r = self.db.execute(
+            'SELECT v.*, c.title_format FROM videos v JOIN channels c '
+            'ON c.id=v.channel_id WHERE v.channel_id=? AND v.id=?',
+            (cid,vid),
+        ).fetchone()
         if not r:
             raise Stop('Unknown video')
         return r
@@ -536,7 +628,9 @@ class Store:
           state=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN 'pending' ELSE videos.state END,
           reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN NULL ELSE videos.reason END''',
           (cid,vid,title,published,int(history),time.time_ns(),stamp))
-        if title.strip() and title != vid and not os.environ.get('YOUTUBE_DATA_API_KEY'):
+        if title.strip() and title != vid and (
+            not os.environ.get('YOUTUBE_DATA_API_KEY') or cid not in API_TITLE_CHANNELS
+        ):
             self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
 
 
@@ -810,7 +904,7 @@ class Store:
         d['marker'] = f"YTG:{row['channel_id']}:{row['id']}"
         d['url'] = 'https://www.youtube.com/watch?v='+row['id']
         d['phase'] = 'finalize' if row['state'] in {'summarized','renamed','verified'} else 'generate'
-        if row['topic']:
+        if row['topic'] or row['title_format'] == 'original':
             d['expected_title'] = title_for(row)
         if row['state']=='reserved':
             d['prompt'] = d['url'] + '\n总结'
@@ -954,8 +1048,10 @@ class Store:
             elif action=='summary':
                 if v['state']!='submitted' or evidence!='youtube-content-complete':
                     raise Stop('Require a completed, content-backed response in the linked chat')
-                title_for(v,value)
-                self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(value,*args))
+                configured = v['title_format']
+                topic = None if configured == 'original' else value
+                title_for(v, topic)
+                self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(topic,*args))
                 self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
                 if current_run['mode']=='history' and current_run['archive_mode']=='extension':
                     self.db.execute('INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)',args)
@@ -1086,11 +1182,11 @@ class Store:
     def report(self,mode='history',channel_id=None):
         if mode not in {'history','incremental'}:
             raise Stop('Unknown report mode')
-        query='SELECT * FROM videos WHERE history=?'
+        query='SELECT v.*, c.title_format FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=?'
         params=(int(mode=='history'),)
         if channel_id:
             self.channel(channel_id)
-            query+=' AND channel_id=?'
+            query+=' AND v.channel_id=?'
             params+=(channel_id,)
         rows=list(self.db.execute(query+' ORDER BY found',params))
         counts={}
@@ -1107,7 +1203,7 @@ class Store:
                 deferred[row['reason']]=deferred.get(row['reason'],0)+1
                 item={k:row[k] for k in ('channel_id','id','title','reason','chat','missing')}
                 item['url']='https://www.youtube.com/watch?v='+row['id']
-                if row['topic']:
+                if row['topic'] or row['title_format'] == 'original':
                     item['expected_title']=title_for(row)
                 review.append(item)
             elif row['state']!='verified':
@@ -1173,6 +1269,54 @@ def add_channel(s,url):
         s.db.execute('INSERT INTO channels(id,url,name) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING',
                      (cid,url,info.get('channel') or cid))
     return dict(s.channel(cid))
+
+
+def preflight(s, cid):
+    """Report local readiness without opening a browser or changing queue state."""
+    channel = dict(s.channel(cid))
+    config = s.channel_config(cid)
+    try:
+        import yt_dlp  # noqa: F401
+        yt_dlp_ready = True
+    except ImportError:
+        yt_dlp_ready = False
+    return {
+        # A local CLI cannot certify the approved browser session. WorkBuddy
+        # must perform that visible-page check before queue operations.
+        'ready': False,
+        'channel': {
+            'id': channel['id'],
+            'name': channel['name'],
+            'notebook_registered': bool(channel['notebook']),
+        },
+        'configuration': config,
+        'database': {
+            'path': str(s.path),
+            'canonical': True,
+            'write_performed': False,
+        },
+        'requirements': {
+            'browser': {
+                'required': True,
+                'satisfied': False,
+                'evidence': 'WorkBuddy must prove readable Gemini DOM and one harmless UI action in its approved browser',
+            },
+            'notebook': {
+                'required': True,
+                'satisfied': bool(channel['notebook']),
+            },
+            'yt_dlp': {
+                'required': True,
+                'satisfied': yt_dlp_ready,
+            },
+        },
+    }
+
+
+def require_channel_config(s, cid):
+    config = s.channel_config(cid)
+    if not config['complete']:
+        raise Stop('Channel setup is incomplete; confirm rename strategy, title format, and membership first')
 
 def scan(s,cid,full=False,fetch=extract,run=None):
     import backfill
@@ -1420,7 +1564,7 @@ def title_refresh(s,cid,limit=None,states=None):
     """Correct stored titles to the original YouTube titles through the official API."""
     import backfill
     s.channel(cid)
-    wanted = [x.strip() for x in (states or 'pending,deferred,verified,renamed,summarized').split(',') if x.strip()]
+    wanted = [x.strip() for x in (states or 'pending,deferred').split(',') if x.strip()]
     rows = s.db.execute("SELECT id,title,title_source,published,state,chat FROM videos WHERE channel_id=? AND state IN (%s) ORDER BY (published IS NULL) DESC, published DESC, id" % ','.join('?'*len(wanted)),(cid,*wanted)).fetchall()
     if limit:
         rows = rows[:limit]
@@ -1452,6 +1596,11 @@ def main(argv=None):
     p.add_argument('--verbose',action='store_true',help='Return full records for troubleshooting')
     sub = p.add_subparsers(dest='cmd',required=True)
     a = sub.add_parser('status'); a.add_argument('--channel')
+    a = sub.add_parser('preflight'); a.add_argument('--channel', required=True)
+    a = sub.add_parser('channel-config'); a.add_argument('channel')
+    a.add_argument('--rename-strategy', choices=sorted(RENAME_STRATEGIES))
+    a.add_argument('--title-format', choices=sorted(TITLE_FORMATS))
+    a.add_argument('--membership', choices=sorted(MEMBERSHIP_STATUSES))
     a = sub.add_parser('pace'); a.add_argument('kind',choices=['access'],help='Claim a slot before one non-submission Gemini UI action'); a.add_argument('--run',help='Current run that owns the account coordination slot')
     a = sub.add_parser('metadata-backfill'); a.add_argument('operation',choices=['start','run','status','report','resume']); a.add_argument('job',nargs='?'); a.add_argument('--channel'); a.add_argument('--confirmed',action='store_true')
     a = sub.add_parser('add'); a.add_argument('url')
@@ -1480,6 +1629,17 @@ def main(argv=None):
             raise Stop('Task database is missing; refusing to create an empty replacement')
         s = Store(args.db)
         if args.cmd=='status': result=s.status(verbose=args.verbose,channel_id=args.channel)
+        elif args.cmd=='preflight': result=preflight(s,args.channel)
+        elif args.cmd=='channel-config':
+            if not any((args.rename_strategy, args.title_format, args.membership)):
+                result=s.channel_config(args.channel)
+            else:
+                result=dict(s.configure_channel(
+                    args.channel,
+                    rename_strategy=args.rename_strategy,
+                    title_format=args.title_format,
+                    membership_status=args.membership,
+                ))
         elif args.cmd=='pace': result=s.browser_access(args.kind,owner=args.run)
         elif args.cmd=='metadata-backfill':
             import backfill
@@ -1516,8 +1676,12 @@ def main(argv=None):
             result=dict(s.channel(args.channel))
         elif args.cmd=='scan':
             ids = [args.channel] if args.channel else [x[0] for x in s.db.execute('SELECT id FROM channels')]
+            for cid in ids:
+                require_channel_config(s, cid)
             result=[scan(s,c,args.full or now().weekday()==0,run=args.run) for c in ids]
         elif args.cmd=='begin':
+            if args.channel:
+                require_channel_config(s, args.channel)
             if args.archive=='extension' and (args.mode!='history' or not args.channel):
                 raise Stop('Extension archive requires channel-scoped history')
             if args.archive and args.run:

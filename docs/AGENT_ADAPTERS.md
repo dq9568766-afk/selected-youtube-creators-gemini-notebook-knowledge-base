@@ -4,6 +4,8 @@
 
 2026-11-03 用户已授权历史批量改名例外：生成继续使用 Codex 内置浏览器，改名阶段可切到本项目外部 Chrome 扩展；增量不变。此例外不是浏览器恢复的替代路径，不得在内置浏览器生成故障时用外部浏览器继续发送。扩展仅改 Gemini 聊天，详细入口、租约及安装确认见 [HISTORY_RENAME.md](HISTORY_RENAME.md)。
 
+WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验和普通页面核验优先使用 WorkBuddy 内置浏览器。由于 WorkBuddy 内置浏览器无法加载扩展，只有显式选择历史扩展归档时，才在外部 Windows 浏览器加载并运行 `extensions/history-renamer`。外部浏览器不承担 Gemini 生成、重试、恢复或替代内置浏览器的故障处理。
+
 适配信息核对日期：2026-10-28。平台的安装入口和工具能力可能变化，分发前应复核对应官方文档。
 
 ## 通用能力契约
@@ -30,10 +32,15 @@
 
 ## WorkBuddy
 
-- WorkBuddy 文档支持以 `SKILL.md` 为入口、附带参考文件的技能目录；平台市场创建与安装流程由 WorkBuddy 自身管理。
-- 分发到 WorkBuddy 市场或 Open Platform 时，按当时的格式要求补齐展示名称、双语描述、示例、版本和作者等平台元数据。本文仓库的 `SKILL.md` 是通用源格式，不假设所有平台专用元数据字段都能原样互通。
-- 仅在当前 WorkBuddy 会话确实提供可操作 Gemini 页面、项目文件访问和 shell 时执行队列工作。若 Agent Browser 或其他连接器未安装、未授权、未登录 Gemini，或无法核验 Notebook/聊天证据，则停止队列操作。
-- WorkBuddy 的技能安装成功不等于已具备浏览器、终端或 Gemini 登录权限；启动前逐项执行“通用能力契约”。
+- WorkBuddy 文档支持以 `SKILL.md` 为入口、附带 `references/` 和 `scripts/` 的技能目录；平台市场创建与安装流程由 WorkBuddy 自身管理。
+- 使用项目根目录的打包器生成 WorkBuddy 包：`python workbuddy_package.py --output PATH`。它只复制公开规则、脚本和扩展，不复制任务数据库、浏览器资料、凭据或摘要。
+- 上传或安装生成目录中的 `SKILL.md` 所在目录，不要把 `%LOCALAPPDATA%/youtube-gemini-channel-summarizer/tasks.sqlite3` 打包进去。包内脚本位于 `scripts/`，执行时保持该包的项目根目录或明确使用 `python scripts/ytg.py`。
+- 频道首次确认完成后，用 `python scripts/ytg.py channel-config CHANNEL_ID --rename-strategy RENAME_STRATEGY --title-format TITLE_FORMAT --membership MEMBERSHIP` 持久化选择；可选值分别是 `serial`/`extension`、`original`/`topic`/`date-topic`、`yes`/`no`/`unknown`。该命令不启动扫描、不发送 Gemini。
+- 仅在当前 WorkBuddy 会话确实提供可操作 Gemini 页面、项目文件访问和 shell 时执行队列工作。启动前必须由 WorkBuddy 浏览器完成：打开登记 Notebook、读回完整页面、执行一次无副作用交互并读回结果，同时核对账号和 Notebook。仅有标签标题、URL、9222/CDP 端口或浏览器进程不算通过。
+- 若 Agent Browser、Playwright MCP 或其他合规连接器未安装、未授权、未登录 Gemini，或无法核验 Notebook/聊天证据，则停止队列操作；不得改用外部 Chrome、远程调试、Cookie、Token、浏览器配置文件、Gemini API 或私有 RPC。
+- 上一条限制不影响已明确授权的历史扩展例外：外部 Windows 浏览器只能在 `history-rename serve RUN` 后加载本项目扩展并执行改名/重开/核验；不能用它绕过 WorkBuddy 内置浏览器的生成、发送或恢复门槛。
+- 可先运行只读自检：`python scripts/ytg.py preflight --channel CHANNEL_ID`。该命令永远不会替 WorkBuddy 伪造浏览器通过；返回 `ready:false` 时必须完成页面能力检查后再继续。
+- WorkBuddy 技能安装成功不等于已具备浏览器、终端、同一 Windows 用户的 canonical 任务库或 Gemini 登录权限；这些必须分别验证。
 
 ## Claude Code
 
