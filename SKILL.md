@@ -1,5 +1,5 @@
 ---
-name: youtube-creator-gemini-notebook-knowledge-base
+name: dq-youtube-creator-gemini-notebook-knowledge-base
 description: Collect a selected YouTube creator's public video metadata and organize one verified summary chat per video in Gemini Notebooks. Use for project setup, maintenance, or explicitly requested queue operations in any agent environment with the required repository, shell, and authenticated Gemini browser capabilities.
 ---
 
