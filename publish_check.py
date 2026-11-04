@@ -6,10 +6,10 @@ import sys
 
 ROOT=Path(__file__).resolve().parent
 TOP={'.gitignore','.githooks/pre-push','LICENSE','NOTICE.md','README.md','AGENTS.md','SKILL.md','agents/openai.yaml','pyproject.toml',
-     'ytg.py','backfill.py','publish_check.py',
+     'ytg.py','backfill.py','history_rename.py','publish_check.py',
      '.agents/skills/youtube-creator-gemini-notebook-knowledge-base/SKILL.md',
      '.agents/skills/youtube-creator-gemini-notebook-knowledge-base/agents/openai.yaml'}
-PREFIX=('tests/','docs/','vendor/youtube-summarizer-chrome/','.github/workflows/')
+PREFIX=('tests/','docs/','vendor/youtube-summarizer-chrome/','extensions/history-renamer/','.github/workflows/')
 SENSITIVE=re.compile(r'(^|/)(runtime|work|screenshots|\.venv|__pycache__)(/|$)|cookie|token|credential|profile|storage_state|\.env|\.(db|sqlite\d*|log|jsonl)(-|$)',re.I)
 SECRETS=[re.compile(x) for x in [r'gh[pousr]_[A-Za-z0-9]{20,}',
           r'github_pat_[A-Za-z0-9_]{20,}',r'AIza[0-9A-Za-z_-]{30,}',

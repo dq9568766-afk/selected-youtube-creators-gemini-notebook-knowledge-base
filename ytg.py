@@ -228,6 +228,8 @@ class Store:
                     self.db.execute('ALTER TABLE videos ADD COLUMN title_source TEXT')
         run_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
         with self.tx():
+            if 'archive_mode' not in run_columns:
+                self.db.execute("ALTER TABLE runs ADD COLUMN archive_mode TEXT NOT NULL DEFAULT 'serial'")
             for name, declaration in [('scan_stamp','TEXT'), ('outcome','TEXT'), ('parent_run','TEXT')]:
                 if name not in run_columns:
                     self.db.execute(f'ALTER TABLE runs ADD COLUMN {name} {declaration}')
@@ -288,6 +290,17 @@ class Store:
                 # counters, never video state or leases.
                 self.db.execute("UPDATE pacing SET processed=0,break_started=NULL WHERE scope NOT IN ('*','gemini-account')")
         self._migrate_pause()
+        import history_rename
+        self.db.executescript(history_rename.SCHEMA)
+        history_rename_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(history_rename_items)')}
+        with self.tx():
+            for name, declaration in [
+                ('recovery_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+                ('verification_phase', 'TEXT'),
+                ('verification_mode', "TEXT NOT NULL DEFAULT 'extension-reopen-v1'"),
+            ]:
+                if name not in history_rename_columns:
+                    self.db.execute(f'ALTER TABLE history_rename_items ADD COLUMN {name} {declaration}')
         # Preserve an existing worker's ownership and expiry during the upgrade.
         with self.tx():
             if 'singleton' in {r['name'] for r in self.db.execute('PRAGMA table_info(lease)')}:
@@ -722,7 +735,9 @@ class Store:
                 raise Stop('Resolve the active submission before finalization')
             return self._claim(run,active)
         backlog=self.db.execute("SELECT * FROM videos WHERE history=? AND state IN ('summarized','renamed')"+scope+" ORDER BY (state='renamed') DESC,found LIMIT 1",args).fetchone()
-        if backlog:
+        batch = r['mode']=='history' and r['archive_mode']=='extension'
+        unqueued = backlog and not self.db.execute('SELECT 1 FROM history_rename_items WHERE channel_id=? AND video_id=?',(backlog['channel_id'],backlog['id'])).fetchone()
+        if backlog and (not batch or archive_only or unqueued):
             self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
             return self._claim(run,backlog)
         self.db.execute("UPDATE runs SET phase='generate' WHERE id=?",(run,))
@@ -730,6 +745,8 @@ class Store:
             return {'stop':'no_finalize'}
         pending=self.db.execute("SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=? AND v.state IN ('pending','reserved') AND v.missing=0 AND c.initialized=1 AND c.notebook IS NOT NULL"+(' AND v.channel_id=?' if r['channel_id'] else '')+" ORDER BY (v.state='reserved') DESC,c.turn,COALESCE(v.published,'') DESC,v.found LIMIT 1",args).fetchone()
         if not pending:
+            if backlog and batch:
+                return {'stop':'archive_pending','next_action':'history-rename serve RUN; finish external extension batch'}
             return {'stop':'empty'}
         if r['mode']=='incremental' and r['armed']>=20:
             return {'stop':'round_cap','armed':r['armed']}
@@ -824,11 +841,13 @@ class Store:
         """Release a historical worker at a safe boundary for the daily round."""
         with self.tx():
             self.check_lease(run)
+            if self.db.execute('SELECT 1 FROM history_rename_sessions WHERE run_id=? AND expires>?',(run,time.time())).fetchone():
+                raise Stop('Stop the external rename bridge before handing off history')
             r = self.db.execute('SELECT mode,channel_id FROM runs WHERE id=?',(run,)).fetchone()
             if r['mode']!='history':
                 raise Stop('Only a historical round can be parked')
             scope=' AND channel_id=?' if r['channel_id'] else ''
-            if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone():
+            if self.db.execute("SELECT 1 FROM videos WHERE history=1 AND (state IN ('submitting','submitted','uncertain') OR (state IN ('summarized','renamed') AND NOT EXISTS (SELECT 1 FROM history_rename_items h WHERE h.channel_id=videos.channel_id AND h.video_id=videos.id)))"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone():
                 raise Stop('Resolve the active chat before parking')
             self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE owner=? AND state='reserved'",(run,))
             self.db.execute("UPDATE videos SET owner=NULL,reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state='summarized'",(run,))
@@ -843,6 +862,8 @@ class Store:
             if current_run['channel_id'] and current_run['channel_id']!=cid:
                 raise Stop('Video is outside run channel scope')
             if action in {'arm','retry'}:
+                if self.db.execute('SELECT 1 FROM history_rename_sessions WHERE run_id=? AND expires>?',(run,time.time())).fetchone():
+                    raise Stop('Stop the external rename bridge before generating another video')
                 pause=self.pause_for(cid)
                 if pause:
                     raise Stop('Submission blocked by '+pause+' pause')
@@ -877,7 +898,11 @@ class Store:
                     raise Stop(f'Finish the {BREAK_SECONDS}-second break before submitting')
                 scope=' AND channel_id=?' if current_run['channel_id'] else ''
                 params=(v['history'],vid,current_run['channel_id']) if current_run['channel_id'] else (v['history'],vid)
-                if self.db.execute("SELECT 1 FROM videos WHERE history=? AND id<>? AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',params).fetchone():
+                batch = current_run['mode']=='history' and current_run['archive_mode']=='extension'
+                outstanding = "state IN ('submitting','submitted','summarized','renamed','uncertain')"
+                if batch:
+                    outstanding = "(state IN ('submitting','submitted','uncertain') OR (state IN ('summarized','renamed') AND NOT EXISTS (SELECT 1 FROM history_rename_items h WHERE h.channel_id=videos.channel_id AND h.video_id=videos.id)))"
+                if self.db.execute("SELECT 1 FROM videos WHERE history=? AND id<>? AND "+outstanding+scope+' LIMIT 1',params).fetchone():
                     raise Stop('Finish the current video before submitting another')
                 if v['state']!='reserved' or not metadata_fresh(v):
                     raise Stop('Only a reserved item with verified metadata can be armed')
@@ -932,6 +957,11 @@ class Store:
                 title_for(v,value)
                 self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(value,*args))
                 self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
+                if current_run['mode']=='history' and current_run['archive_mode']=='extension':
+                    self.db.execute('INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)',args)
+                    # Count the checked generation once, not again at batch rename.
+                    self._count_processed(run,cid,vid)
+                    self.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(cid,))
                 self.set('source_failures',0)
                 self.set('source_failures:'+cid,0)
                 self.db.execute('UPDATE runs SET failure_streak=0,health_probe=0,health_after=0 WHERE id=?',(run,))
@@ -1010,6 +1040,8 @@ class Store:
                     raise Stop('Incremental tasks remain; continue before ending')
                 self.db.execute('UPDATE runs SET outcome=? WHERE id=?',('budget_exhausted' if remaining else 'complete',run))
             unresolved = self.db.execute("SELECT count(*) FROM videos WHERE owner=? AND state IN ('submitting','submitted','summarized','renamed','uncertain')",(run,)).fetchone()[0]
+            if r['mode']=='history' and r['channel_id'] and self.db.execute("SELECT 1 FROM history_rename_items WHERE channel_id=? AND chat_status='pending' LIMIT 1",(r['channel_id'],)).fetchone():
+                raise Stop('Finish or explicitly review the history rename backlog before ending')
             if unresolved:
                 raise Stop('Finish or pause the outstanding chat before ending the round')
             self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE owner=? AND state='reserved'",(run,))
@@ -1034,6 +1066,7 @@ class Store:
         parent=self.db.execute('SELECT * FROM runs WHERE id=?',(r['parent_run'],)).fetchone()
         self.end(run)
         target=self.begin('history',channel_id=cid,policy=parent['policy'])
+        self.db.execute('UPDATE runs SET archive_mode=? WHERE id=?',(parent['archive_mode'],target['id']))
         return {'run':target['id'],'mode':'history','channel_id':cid,'policy':target['policy'],'next_action':'prepare RUN; continue in the same worker'}
 
     def status(self,verbose=True,channel_id=None):
@@ -1079,8 +1112,10 @@ class Store:
                 review.append(item)
             elif row['state']!='verified':
                 remaining+=1
-        return {'mode':mode,'channel_id':channel_id,'complete':remaining==0,'remaining':remaining,
-                'counts':counts,'deferred':[{'reason':k,'count':v} for k,v in sorted(deferred.items())],
+        rename_pending = self.db.execute("SELECT count(*) FROM history_rename_items WHERE chat_status='pending'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ()).fetchone()[0] if mode=='history' else 0
+        rename_review = [dict(x) for x in self.db.execute("SELECT channel_id,video_id,chat_status,reason FROM history_rename_items WHERE chat_status='review'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ())] if mode=='history' else []
+        return {'mode':mode,'channel_id':channel_id,'complete':remaining==0 and rename_pending==0,'remaining':remaining,'rename_pending':rename_pending,
+                'rename_manual_review':rename_review,'counts':counts,'deferred':[{'reason':k,'count':v} for k,v in sorted(deferred.items())],
                 'manual_review':review,'generated':generated,'verified':counts.get('verified',0),
                 'not_generated':total-generated,'success_rate':generated/total if total else 0}
 
@@ -1339,7 +1374,7 @@ def prepare(s,run,fetch=extract):
         s.check_lease(run)
         r = s.db.execute('SELECT mode,channel_id FROM runs WHERE id=?',(run,)).fetchone()
         scope=' AND channel_id=?' if r['channel_id'] else ''
-        active = s.db.execute("SELECT 1 FROM videos WHERE history=1 AND state IN ('submitting','submitted','summarized','renamed','uncertain')"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone()
+        active = s.db.execute("SELECT 1 FROM videos WHERE history=1 AND (state IN ('submitting','submitted','uncertain') OR (state IN ('summarized','renamed') AND NOT EXISTS (SELECT 1 FROM history_rename_items h WHERE h.channel_id=videos.channel_id AND h.video_id=videos.id)))"+scope+' LIMIT 1',(r['channel_id'],) if r['channel_id'] else ()).fetchone()
         if r['mode']=='history' and not active and s.daily_due(r['channel_id']):
             return {'stop':'daily_due','next_action':'handoff RUN; scan and process returned incremental run; handoff back to history in the same worker'}
     item = s.reserve(run)
@@ -1423,6 +1458,8 @@ def main(argv=None):
     a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
     a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true'); a.add_argument('--channel'); a.add_argument('--policy',choices=['strict','collect-first'],default='strict'); a.add_argument('--run')
+    a.add_argument('--archive',choices=['serial','extension'],default=None,help='History only: batch rename in the external extension')
+    a = sub.add_parser('history-rename'); a.add_argument('operation',choices=['configure','enable','serve','report','review']); a.add_argument('run',nargs='?'); a.add_argument('--channel'); a.add_argument('--account'); a.add_argument('--port',type=int,default=8765); a.add_argument('--include-verified',action='store_true'); a.add_argument('--video'); a.add_argument('--reason')
     a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
@@ -1480,7 +1517,25 @@ def main(argv=None):
         elif args.cmd=='scan':
             ids = [args.channel] if args.channel else [x[0] for x in s.db.execute('SELECT id FROM channels')]
             result=[scan(s,c,args.full or now().weekday()==0,run=args.run) for c in ids]
-        elif args.cmd=='begin': result=s.begin(args.mode,args.scheduled,args.channel,args.policy,args.run)
+        elif args.cmd=='begin':
+            if args.archive=='extension' and (args.mode!='history' or not args.channel):
+                raise Stop('Extension archive requires channel-scoped history')
+            if args.archive and args.run:
+                existing=s.db.execute('SELECT archive_mode FROM runs WHERE id=?',(args.run,)).fetchone()
+                if not existing or existing['archive_mode']!=args.archive:
+                    raise Stop('Use history-rename enable to switch an existing history run')
+            if args.archive=='extension':
+                import history_rename
+                if args.scheduled:
+                    raise Stop('Extension history runs cannot be scheduled incrementals')
+                result=history_rename.begin_extension(s,args.channel,args.policy,args.run)
+            else:
+                result=s.begin(args.mode,args.scheduled,args.channel,args.policy,args.run)
+                if args.archive:
+                    result=dict(s.db.execute('SELECT * FROM runs WHERE id=?',(result['id'],)).fetchone())
+        elif args.cmd=='history-rename':
+            import history_rename
+            result=history_rename.dispatch(s,args)
         elif args.cmd=='next': result=s.reserve(args.run,args.parallel)
         elif args.cmd=='prepare': result=prepare(s,args.run)
         elif args.cmd=='finalize': result=s.finalize(args.run)

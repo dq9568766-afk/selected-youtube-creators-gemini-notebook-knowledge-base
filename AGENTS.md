@@ -2,6 +2,8 @@
 
 使用中文简洁交流。队列行为唯一详细规程为 docs/WORKER.md；先读 SKILL.md 与该规程。用户授权一次性历史采集且允许异常后置时使用频道范围 collect-first，普通运行默认 strict。
 
+频道改名方案（新频道首次开始时必须询问并记录）：方案1为原方案，Gemini 总结后由 Codex 按网页流程逐条改名并核验；方案2为本项目扩展，历史总结仍在内置浏览器生成，之后由 `extensions/history-renamer` 控制专用浏览器标签完成打开、切换、改名、重开和核验，不调用模型。方案1无需安装扩展、流程直接且每条总结后立即核验，但每条改名都需要 Codex/模型介入，历史回改耗时且增加模型用量。方案2可省去历史改名和核验阶段的模型用量，适合已有历史聊天批量整理；需加载扩展、启动本机服务并保持浏览器页面运行，速度受页面操作和节流限制。扩展每条最多自动重开两次，仍无法确认才保留 pending，不伪造成功。新频道展示两方案优劣后再选；老频道沿用已记录选择，不重复询问。增量一律保持原方案。已选方案2时，历史通过 `--archive extension` 或 `history-rename enable` 显式启用，允许已核对完整总结的 summarized 项排队后继续生成，待扩展重开核验后才记 verified。详细规程见 docs/WORKER.md 及 docs/HISTORY_RENAME.md。NotebookLM 的 Gemini 对话来源不能独立改名，工具只改 Gemini 聊天，不假定来源同步。
+
 - 在包含 ytg.py 的本目录运行；唯一真实任务数据库为 %LOCALAPPDATA%/youtube-gemini-channel-summarizer/tasks.sqlite3。不得重建或复制到同步目录；测试仅用隔离临时数据库。
 - 先查一次 status/租约，确认指定频道与登记 Notebook。不得处理其他频道、接管其他有效租约或自行更换账号/Notebook。
 - collect-first 的无正文、未知提交、聊天不明、元数据限制、内容失败与归档未核验按 WORKER 延期后继续；首轮不搜索；仅允许20秒无正文且确认停止后在同聊天快速重试一次，延期后不重发。首次必须 arm、重试必须 retry 登记后再发送，延期不是成功。其他频道的有效频道租约和账号协调槽不构成本频道阻塞：频道租约按 scope 判断，账号槽由 pace access/arm/retry 返回剩余秒数，ready=false 时等待后重试原命令。

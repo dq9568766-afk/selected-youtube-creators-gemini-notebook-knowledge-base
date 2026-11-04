@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "历史视频批量改名",
+  "version": "0.2.0",
+  "description": "通过网页菜单批量改名并核验历史 Gemini 聊天，不调用模型。",
+  "permissions": ["scripting"],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "action": {"default_title": "打开历史改名工具"},
+  "background": {"service_worker": "background.js"},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}
