@@ -1331,6 +1331,7 @@ def preflight(s, cid):
     channel = dict(s.channel(cid))
     config = s.channel_config(cid)
     date_status = s.date_backfill_status(cid)
+    notebook_registered = bool(channel['notebook'])
     try:
         import yt_dlp  # noqa: F401
         yt_dlp_ready = True
@@ -1343,7 +1344,7 @@ def preflight(s, cid):
         'channel': {
             'id': channel['id'],
             'name': channel['name'],
-            'notebook_registered': bool(channel['notebook']),
+            'notebook_registered': notebook_registered,
         },
         'configuration': config,
         'date_backfill': date_status,
@@ -1360,7 +1361,7 @@ def preflight(s, cid):
             },
             'notebook': {
                 'required': True,
-                'satisfied': bool(channel['notebook']),
+                'satisfied': notebook_registered,
             },
             'yt_dlp': {
                 'required': True,
@@ -1370,6 +1371,15 @@ def preflight(s, cid):
                 'required': date_status['required'],
                 'satisfied': not date_status['blocked'],
             },
+        },
+        'notebook_setup': {
+            'required': True,
+            'registered': notebook_registered,
+            'next_action': (
+                None if notebook_registered else
+                '在当前智能体允许的 Gemini 内置浏览器中创建并核验频道 Notebook，'
+                '再运行 notebook CHANNEL_ID NOTEBOOK_URL 登记'
+            ),
         },
     }
 

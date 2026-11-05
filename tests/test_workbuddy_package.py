@@ -21,6 +21,8 @@ class WorkBuddyPackageTests(unittest.TestCase):
             self.assertNotIn('Codex built-in in-app browser', skill)
             self.assertIn('外部 Windows 浏览器只在', skill)
             self.assertIn('不能替代内置浏览器发送或恢复 Gemini 任务', skill)
+            self.assertIn('summary` and `verify` are actions of `step`', skill)
+            self.assertIn('Never invent `summary RUN` or `verify RUN` commands', skill)
             self.assertTrue((output / 'references' / 'WORKER.md').is_file())
             self.assertTrue((output / 'references' / 'AGENT_ADAPTERS.md').is_file())
             self.assertTrue((output / 'scripts' / 'ytg.py').is_file())

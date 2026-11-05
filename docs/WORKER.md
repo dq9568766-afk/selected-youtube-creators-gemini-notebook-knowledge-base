@@ -74,11 +74,11 @@ python ytg.py metadata-backfill report JOB_ID
 1. `prepare RUN`：历史和增量长期复用已核实的视频/频道、发布日期和原标题。王志安频道标题必须是 `YYYYMMDD-1–5个汉字中文主题-完整原视频标题`；主题用中文，原视频标题完整照录，包括原题中的英文；日期缺失时延期，不猜测。只有字段缺失时才查询当前reserved单条。
 2. 新视频不搜索、不查历史。已登记 chat 直接打开一次；无法确定链接、内容或 Notebook 归属，记 chat_unidentified。若是页面读取/连接问题，先按下方有限恢复处理。
 3. 核对空白入口及原视频链接，`step RUN CHANNEL VIDEO arm` 后才发送一次消息，内容为视频 URL 换行加“总结”。原消息出现且 URL 稳定后读取一次并 `attach --value CHAT_URL --evidence video-match`；仅地址不稳定、导航变化或身份不明时复查。地址读取用当前浏览器提供的标签信息；不要为了找地址创建公开分享链接。
-4. collect-first 每次提交后等待20秒，只检查一次；页面操作耗时计入等待。一次读取合并核对生成状态、实质正文、原视频链接、账号和Notebook归属。证据齐全且生成完成立即执行 `summary --value 主题词 --evidence youtube-content-complete --next`；主题词1–5汉字。首次检查已有正文但仍未完成，停止并确认后记 generation_timeout，不重发，不延长等待。
+4. collect-first 每次提交后等待20秒，只检查一次；页面操作耗时计入等待。一次读取合并核对生成状态、实质正文、原视频链接、账号和Notebook归属。证据齐全且生成完成立即执行 `step RUN CHANNEL VIDEO summary --value 主题词 --evidence youtube-content-complete --next`；主题词1–5汉字。首次检查已有正文但仍未完成，停止并确认后记 generation_timeout，不重发，不延长等待。
 5. 首次20秒检查无正文且当前页面可见原消息、确认已提交时，停止生成并确认已停止（已自然结束则核对无生成中状态）。停止确认时若正文已出现，完整则归档，未完整则延期，不重发。仍无正文且当前页面未跳转或中断时直接在原输入框准备重发，不增加同聊天确认步骤，不要求先取得聊天地址；发送前执行 `step RUN CHANNEL VIDEO retry --evidence EVIDENCE` 登记意图：已attach时使用 `20s-no-body-stopped-same-chat`，尚无地址且状态仍为submitting时使用 `20s-no-body-stopped-current-page`。若原消息未确认、页面跳转/中断、账号或Notebook归属不明，不重发，按相应规则延期或恢复。retry成功后在当前原输入框重发视频URL换行加“总结”一次，不再arm。重发后从实际发送重新计20秒，只检查一次；如获得稳定聊天地址且原请求匹配，使用 `attach --value CHAT_URL --evidence video-match`。若没有地址，保持submitting直到获得地址或延期，不凭空登记提交成功；完整生成仍无法登记地址记chat_unidentified，不能summary或计成功。未完成则停止并确认后记generation_timeout；重发是否提交无法确认记submission_unconfirmed。retry_count持久化，每条最多两次提交；重试中断按未确认提交处理，不再重发。retry因增量预算耗尽被拒绝时直接延期，不绕过预算。
 6. 提交是否发生无法确认记 submission_unconfirmed；地址或聊天身份不明记 chat_unidentified；内容不匹配、拒答或仅复述标题记 content_failed，不触发快速重试。执行 `defer --value REASON --next` 后继续。首轮不搜索；唯一重发例外是上一步无正文且已确认停止的同聊天一次重试，延期后不自动再入队。超时仍有停止按钮时点击一次并核对已停止；无法停止、无法读回或无法建立下一条独立空白入口，进入有限浏览器恢复，失败则全局停止，不能继续并行提交。
 
-7. 每条总结完成后立即改名并核验，核验成功或明确延期后立即处理下一条；用户未明确要求单条暂停时不得在这里结束 Goal 或调用 `cleanup`。`summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`，再用 `verify ... --next` 推进。`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。
+7. 每条总结完成后立即改名并核验，核验成功或明确延期后立即处理下一条；用户未明确要求单条暂停时不得在这里结束 Goal 或调用 `cleanup`。`step RUN CHANNEL VIDEO summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`，再用 `step RUN CHANNEL VIDEO verify --value EXPECTED_TITLE --evidence current-page-video-summary --next` 推进。`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。
 
 ## 共用改名、核验与休息
 

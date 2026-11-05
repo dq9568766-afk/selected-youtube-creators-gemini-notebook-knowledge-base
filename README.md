@@ -63,6 +63,8 @@ python workbuddy_package.py --output C:\path\to\workbuddy-skill
 
 如果标题格式选择发布日期，项目会先建立视频清单，再检查日期覆盖率。日期未补齐前不会进入 Gemini 总结；需先完成 `metadata-backfill`，确认报告 `complete=true` 后再继续。
 
+新频道还必须先有已核验的 Gemini Notebook。日期补齐后，如果 `preflight` 显示 Notebook 未登记，当前智能体会在获准的 Gemini 内置浏览器中创建并核验 Notebook，再登记其实际 URL；创建或核验失败时不会开始总结。
+
 ### ▶️ 装好后，给它一个频道
 
 把示例地址替换成你想整理的频道，再发给智能体：

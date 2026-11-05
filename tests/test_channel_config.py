@@ -77,6 +77,13 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertTrue(result['requirements']['browser']['required'])
         self.assertFalse(result['database']['write_performed'])
 
+    def test_preflight_requires_browser_creation_before_notebook_registration(self):
+        self.store.db.execute('UPDATE channels SET notebook=NULL WHERE id=?', (CID,))
+        result = ytg.preflight(self.store, CID)
+        self.assertFalse(result['requirements']['notebook']['satisfied'])
+        self.assertFalse(result['notebook_setup']['registered'])
+        self.assertIn('创建并核验频道 Notebook', result['notebook_setup']['next_action'])
+
     def test_date_topic_history_is_blocked_until_date_backfill_is_settled(self):
         self.store.configure_channel(
             CID,

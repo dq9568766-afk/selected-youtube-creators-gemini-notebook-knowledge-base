@@ -18,14 +18,18 @@ WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验和普通页
 4. 通过用户已有的登录会话打开和操作 Gemini 网页，查看实际消息、生成结果、聊天 URL 和 Notebook 归属。
 5. 在不确定消息是否提交时保留证据并遵守运行策略：strict暂停，collect-first按docs/WORKER.md登记单条延期；未知提交不重发。仅已确认提交且页面未跳转或中断时，才可按WORKER在20秒无正文并确认停止后于当前输入框重试一次；重试前不要求聊天地址。
 6. Gemini 非提交 UI 动作前运行 `python ytg.py pace access --run RUN`；只在返回 ready=true 后立即执行一个动作。协调权只覆盖当前页面动作窗口，其他频道可以并行等待生成，但页面动作和提交必须按账号顺序执行；arm/retry 负责原子检查并登记提交时间；ready=false 时按返回的秒数等待，不做网页操作。
+7. 新频道的 Notebook 建立也是强制前置流程：全量扫描和日期补齐完成后，读取 `preflight` 的 `notebook_setup`。未登记时，当前智能体必须在自己获准的 Gemini 内置浏览器中创建频道 Notebook，核对账号、Notebook 名称和实际 URL，再执行 `python ytg.py notebook CHANNEL_ID NOTEBOOK_URL`。创建失败、账号不符或 URL 无法核验时停止，不进入 Gemini 总结。该流程不使用 Gemini API、私有 RPC 或浏览器凭据。
 
 恢复约定：collect-first的临时连接/页面故障按docs/WORKER.md执行最多3次有限恢复；strict自动重连一次。已知账号或服务全局暂停后，用户明确继续/恢复才进行页面检查，不追加确认。恢复时读取详细租约状态，其他有效租约不得抢占。有限恢复失败时保留准确全局暂停、cleanup并结束，不重发或循环探测。
+
+CLI 中 `summary`、`verify` 不是独立命令，而是 `step` 的 action。真实调用分别是 `python ytg.py step RUN CHANNEL VIDEO summary ...` 和 `python ytg.py step RUN CHANNEL VIDEO verify ...`；准备任务用 `python ytg.py prepare RUN`。`preflight.ready=false` 是因为 CLI 不代替浏览器认证；完成同一获准浏览器中的页面可读、无副作用交互和账号/Notebook核验后，按实际证据继续，不要把该字段误当成永久阻塞。
 
 缺少任一必要能力时，不开始或恢复队列。说明具体缺少的能力，并等待用户配置或改用已具备这些能力的智能体。不得改用 Gemini API、私有 RPC、Cookie/Token、浏览器配置文件、远程调试或其他绕过方式。
 
 ## Codex
 
 - 每次开始或恢复队列处理，先明确选用 Codex 内置浏览器并打开登记的 Gemini Notebook 工作标签，再运行队列状态命令。不要假定浏览器面板、工具存在或旧回合标签就代表本轮已建立可用会话；按 WORKER 验证页面可读和交互后才继续。
+- 新频道若 `preflight` 返回 `notebook_setup.registered=false`，先在 Codex 内置浏览器创建并核验该频道的 Gemini Notebook，再登记 URL；登记成功并重新通过页面核验前，不得开始扫描后的总结。
 - 将本项目目录作为 canonical 技能源；Codex 个人技能入口可指向项目根目录，避免维护第二份内容。目录移动后需更新该入口。
 - 使用 Codex 当前可用且已登录的浏览器会话。实际会话是否能访问 Gemini，以当前 UI 和工具检查为准。
 - 按仓库 `AGENTS.md` 和 `docs/WORKER.md` 执行状态机；状态门槛适用于所有智能体。
@@ -41,6 +45,7 @@ WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验和普通页
 - 上一条限制不影响已明确授权的历史扩展例外：外部 Windows 浏览器只能在 `history-rename serve RUN` 后加载本项目扩展并执行改名/重开/核验；不能用它绕过 WorkBuddy 内置浏览器的生成、发送或恢复门槛。
 - 可先运行只读自检：`python scripts/ytg.py preflight --channel CHANNEL_ID`。该命令永远不会替 WorkBuddy 伪造浏览器通过；返回 `ready:false` 时必须完成页面能力检查后再继续。
 - 若频道标题格式为 `date-topic`，WorkBuddy 必须先读取 `preflight`/`scan` 返回的 `date_backfill`。出现 `blocked=true` 时，不得发送 Gemini；若当前历史 run 持有租约，先 cleanup，再执行 `metadata-backfill start/run/report`，直到 `complete=true`。只有明确 `unavailable` 的日期可以保留 `all_dates_complete=false` 并继续其他视频。
+- 新频道日期补齐完成后，WorkBuddy 必须读取 `preflight.notebook_setup`。若 `registered=false`，优先使用 WorkBuddy 内置浏览器创建并核验频道 Gemini Notebook，再运行 `python scripts/ytg.py notebook CHANNEL_ID NOTEBOOK_URL` 登记；不得用外部 Windows 浏览器创建，也不得在未核验时发送总结。外部浏览器仅保留给显式启用的历史改名扩展。
 - WorkBuddy 技能安装成功不等于已具备浏览器、终端、同一 Windows 用户的 canonical 任务库或 Gemini 登录权限；这些必须分别验证。
 
 ## Claude Code
