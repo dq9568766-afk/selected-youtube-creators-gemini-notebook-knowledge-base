@@ -40,6 +40,7 @@ WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验和普通页
 - 若 Agent Browser、Playwright MCP 或其他合规连接器未安装、未授权、未登录 Gemini，或无法核验 Notebook/聊天证据，则停止队列操作；不得改用外部 Chrome、远程调试、Cookie、Token、浏览器配置文件、Gemini API 或私有 RPC。
 - 上一条限制不影响已明确授权的历史扩展例外：外部 Windows 浏览器只能在 `history-rename serve RUN` 后加载本项目扩展并执行改名/重开/核验；不能用它绕过 WorkBuddy 内置浏览器的生成、发送或恢复门槛。
 - 可先运行只读自检：`python scripts/ytg.py preflight --channel CHANNEL_ID`。该命令永远不会替 WorkBuddy 伪造浏览器通过；返回 `ready:false` 时必须完成页面能力检查后再继续。
+- 若频道标题格式为 `date-topic`，WorkBuddy 必须先读取 `preflight`/`scan` 返回的 `date_backfill`。出现 `blocked=true` 时，不得发送 Gemini；若当前历史 run 持有租约，先 cleanup，再执行 `metadata-backfill start/run/report`，直到 `complete=true`。只有明确 `unavailable` 的日期可以保留 `all_dates_complete=false` 并继续其他视频。
 - WorkBuddy 技能安装成功不等于已具备浏览器、终端、同一 Windows 用户的 canonical 任务库或 Gemini 登录权限；这些必须分别验证。
 
 ## Claude Code

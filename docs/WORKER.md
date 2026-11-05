@@ -37,6 +37,16 @@ python ytg.py channel-config CHANNEL_ID --rename-strategy RENAME_STRATEGY --titl
 
 `original` 表示原标题，`topic` 表示主题分类+原标题，`date-topic` 表示发布日期+主题分类+原标题。缺少配置时，CLI 的 `scan` 和频道范围 `begin` 会停止，不建立新租约。`preflight --channel CHANNEL_ID` 只报告本地状态，不替浏览器证明 Gemini 页面可用。
 
+选择 `date-topic` 时，初次扫描只负责建立公开视频清单；清单建立后，如果仍有缺少 `published` 的历史视频，`begin`/`prepare`/`next` 不得进入 Gemini，总结前必须先完成日期补齐。若当前历史 run 持有频道租约，先执行 `cleanup RUN`，再运行：
+
+```powershell
+python ytg.py metadata-backfill start --channel CHANNEL_ID
+python ytg.py metadata-backfill run JOB_ID
+python ytg.py metadata-backfill report JOB_ID
+```
+
+重复 `run` 直到报告 `complete=true`。报告中的 `all_dates_complete=false` 只允许在所有剩余项目均为明确 `unavailable` 时通过；这类项目不阻塞其他视频，但不能伪造日期。补齐完成不会自动重新入队此前延期的视频，重新处理仍需用户明确要求。
+
 **每次队列处理回合先打开当前智能体的获准内置浏览器。** 不以浏览器工具已可用、侧边已有页面、上轮留下的标签或记忆中的会话代替此步骤。先在当前智能体的获准内置浏览器中选定/创建本轮工作标签，并导航到登记的 Gemini Notebook；确认页面内容可读且可完成一次无副作用交互。之后才运行 `status` 并检查暂停、频道及租约，再开始队列操作。恢复也必须重新执行此门槛。具体标签失效处理见 `docs/AGENT_ADAPTERS.md`；只有显式启用历史改名扩展时，才按上文例外使用外部 Windows 浏览器。页面能力检查失败时按故障范围保留暂停并停止，不运行提交步骤。
 
 每轮读一次 `status`，恢复时再读一次 `--verbose status` 核对 lease 的 run_id/expires；忙碌不等于后台工作。其他频道的有效租约不构成本频道冲突，也不应导致退出；仅 scope 为本频道或 `*` 的有效租约才阻止开始/接手。其他频道的账号协调槽只会让 `pace access`、`arm` 或 `retry` 返回 `ready:false`，应等待其 `seconds_remaining` 后重试原命令。其他有效租约不抢占。登录、验证码、/sorry、配额及确认的账号/浏览器会话故障是全局阻塞，停止所有网页与队列操作，等待用户明确恢复；单条未知提交、来源不可用、健康检查失败和其他视频级问题按频道记录暂停，其他频道仍可在独立租约和页面证据满足时运行；不重复探测或发送状态消息。

@@ -597,6 +597,51 @@ class Store:
             )
         return self.channel(cid)
 
+    def date_backfill_status(self, cid):
+        """Return date coverage and whether date-topic history is blocked."""
+        channel = self.channel(cid)
+        row = self.db.execute(
+            """SELECT count(*) AS total,
+                      sum(CASE WHEN published IS NOT NULL THEN 1 ELSE 0 END) AS dated
+                 FROM videos WHERE channel_id=? AND history=1""",
+            (cid,),
+        ).fetchone()
+        total = int(row['total'] or 0)
+        dated = int(row['dated'] or 0)
+        missing = total - dated
+        job = self.db.execute(
+            'SELECT * FROM metadata_jobs WHERE channel_id=? ORDER BY created DESC LIMIT 1',
+            (cid,),
+        ).fetchone()
+        unresolved = missing
+        if job and missing:
+            unresolved = self.db.execute(
+                """SELECT count(*) FROM videos v
+                   LEFT JOIN metadata_items m
+                     ON m.job=? AND m.video=v.id
+                  WHERE v.channel_id=? AND v.history=1 AND v.published IS NULL
+                    AND (m.video IS NULL OR m.state IN ('pending','fetching','review'))""",
+                (job['id'], cid),
+            ).fetchone()[0]
+        required = channel['title_format'] == 'date-topic'
+        blocked = bool(required and channel['initialized'] and unresolved)
+        return {
+            'required': required,
+            'total': total,
+            'dated': dated,
+            'missing': missing,
+            'date_coverage': dated / total if total else 1,
+            'all_dates_complete': missing == 0,
+            'backfill_job': dict(job) if job else None,
+            'backfill_unresolved': int(unresolved),
+            'blocked': blocked,
+            'next_action': (
+                'cleanup RUN; metadata-backfill start --channel CHANNEL_ID; '
+                'run metadata-backfill until report complete'
+                if blocked else None
+            ),
+        }
+
     def video(self,cid,vid):
         r = self.db.execute(
             'SELECT v.*, c.title_format FROM videos v JOIN channels c '
@@ -662,7 +707,11 @@ class Store:
             reason=self.pause_for(channel_id)
             if reason:
                 raise Stop('Paused: '+reason)
-            if channel_id: self.channel(channel_id)
+            if channel_id:
+                self.channel(channel_id)
+                date_status = self.date_backfill_status(channel_id)
+                if mode == 'history' and date_status['blocked']:
+                    raise Stop('date_backfill_required: '+date_status['next_action'])
             t = now()
             key = None
             if scheduled:
@@ -821,6 +870,10 @@ class Store:
     def _reserve_serial(self,run,archive_only=False):
         r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
         history=int(r['mode']=='history')
+        if history and r['channel_id']:
+            date_status = self.date_backfill_status(r['channel_id'])
+            if date_status['blocked']:
+                return {'stop':'date_backfill_required','next_action':date_status['next_action']}
         scope=' AND channel_id=?' if r['channel_id'] else ''
         args=(history,r['channel_id']) if r['channel_id'] else (history,)
         active=self.db.execute("SELECT * FROM videos WHERE history=? AND state IN ('submitting','submitted','uncertain')"+scope+' ORDER BY found LIMIT 1',args).fetchone()
@@ -1210,10 +1263,12 @@ class Store:
                 remaining+=1
         rename_pending = self.db.execute("SELECT count(*) FROM history_rename_items WHERE chat_status='pending'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ()).fetchone()[0] if mode=='history' else 0
         rename_review = [dict(x) for x in self.db.execute("SELECT channel_id,video_id,chat_status,reason FROM history_rename_items WHERE chat_status='review'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ())] if mode=='history' else []
+        date_status = self.date_backfill_status(channel_id) if channel_id else None
         return {'mode':mode,'channel_id':channel_id,'complete':remaining==0 and rename_pending==0,'remaining':remaining,'rename_pending':rename_pending,
                 'rename_manual_review':rename_review,'counts':counts,'deferred':[{'reason':k,'count':v} for k,v in sorted(deferred.items())],
                 'manual_review':review,'generated':generated,'verified':counts.get('verified',0),
-                'not_generated':total-generated,'success_rate':generated/total if total else 0}
+                'not_generated':total-generated,'success_rate':generated/total if total else 0,
+                'date_backfill':date_status}
 
 class MetadataFailure(Stop):
     """Only a safe category is exposed; raw extractor diagnostics stay in memory."""
@@ -1275,6 +1330,7 @@ def preflight(s, cid):
     """Report local readiness without opening a browser or changing queue state."""
     channel = dict(s.channel(cid))
     config = s.channel_config(cid)
+    date_status = s.date_backfill_status(cid)
     try:
         import yt_dlp  # noqa: F401
         yt_dlp_ready = True
@@ -1290,6 +1346,7 @@ def preflight(s, cid):
             'notebook_registered': bool(channel['notebook']),
         },
         'configuration': config,
+        'date_backfill': date_status,
         'database': {
             'path': str(s.path),
             'canonical': True,
@@ -1308,6 +1365,10 @@ def preflight(s, cid):
             'yt_dlp': {
                 'required': True,
                 'satisfied': yt_dlp_ready,
+            },
+            'date_backfill': {
+                'required': date_status['required'],
+                'satisfied': not date_status['blocked'],
             },
         },
     }
@@ -1432,8 +1493,13 @@ def scan(s,cid,full=False,fetch=extract,run=None):
             date_coverage = 'mixed'
         else:
             date_coverage = 'recent-window'
-    return {'channel_id':cid,'complete':complete,'tabs':results,
-            'date_coverage':date_coverage,'excluded_tabs':['shorts']}
+    date_status = s.date_backfill_status(cid)
+    result = {'channel_id':cid,'complete':complete,'tabs':results,
+              'date_coverage':date_coverage,'date_backfill':date_status,
+              'excluded_tabs':['shorts']}
+    if date_status['blocked']:
+        result['next_action'] = date_status['next_action']
+    return result
 
 def api_metadata(s,run,cid,vid):
     """Resolve the original title and publication date from the official Data API."""

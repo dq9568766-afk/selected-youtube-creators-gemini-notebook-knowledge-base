@@ -61,6 +61,8 @@ python workbuddy_package.py --output C:\path\to\workbuddy-skill
 
 生成包包含 WorkBuddy 所需的双语元数据、`references/`、`scripts/` 和历史改名扩展；不会复制任务数据库、浏览器登录资料或摘要。WorkBuddy 内置浏览器优先负责 Gemini 生成、发送和核验；由于它不能加载扩展，历史批量改名时才在外部 Windows 浏览器加载本项目扩展。外部浏览器不能替代内置浏览器处理 Gemini 生成或恢复。安装技能不等于 WorkBuddy 已具备可操作的 Gemini 浏览器，仍需通过适配指南中的页面能力检查。
 
+如果标题格式选择发布日期，项目会先建立视频清单，再检查日期覆盖率。日期未补齐前不会进入 Gemini 总结；需先完成 `metadata-backfill`，确认报告 `complete=true` 后再继续。
+
 ### ▶️ 装好后，给它一个频道
 
 把示例地址替换成你想整理的频道，再发给智能体：

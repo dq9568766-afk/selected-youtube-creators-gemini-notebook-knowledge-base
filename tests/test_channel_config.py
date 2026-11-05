@@ -77,6 +77,42 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertTrue(result['requirements']['browser']['required'])
         self.assertFalse(result['database']['write_performed'])
 
+    def test_date_topic_history_is_blocked_until_date_backfill_is_settled(self):
+        self.store.configure_channel(
+            CID,
+            rename_strategy='serial',
+            title_format='date-topic',
+            membership_status='no',
+        )
+        self.store.db.execute('UPDATE videos SET published=NULL WHERE channel_id=?', (CID,))
+        status = self.store.date_backfill_status(CID)
+        self.assertTrue(status['required'])
+        self.assertEqual(status['missing'], 1)
+        self.assertTrue(status['blocked'])
+        with self.assertRaisesRegex(ytg.Stop, 'date_backfill_required'):
+            self.store.begin('history', channel_id=CID)
+
+    def test_completed_backfill_with_unavailable_dates_does_not_block_other_items(self):
+        import backfill
+
+        self.store.configure_channel(
+            CID,
+            rename_strategy='serial',
+            title_format='date-topic',
+            membership_status='no',
+        )
+        self.store.db.execute('UPDATE videos SET published=NULL WHERE channel_id=?', (CID,))
+        job = backfill.start(self.store, CID)['id']
+        self.store.db.execute(
+            "UPDATE metadata_items SET state='unavailable', reason='date_not_public' WHERE job=?",
+            (job,),
+        )
+        self.store.db.execute("UPDATE metadata_jobs SET status='complete' WHERE id=?", (job,))
+        status = self.store.date_backfill_status(CID)
+        self.assertFalse(status['blocked'])
+        self.assertFalse(status['all_dates_complete'])
+        self.store.begin('history', channel_id=CID)
+
     def test_channel_config_cli_can_complete_setup(self):
         with tempfile.TemporaryDirectory() as temp:
             db = Path(temp) / 'tasks.sqlite3'
