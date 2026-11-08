@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS history_rename_items(
  verification_mode TEXT NOT NULL DEFAULT 'extension-reopen-v1',
  PRIMARY KEY(channel_id,video_id));
 CREATE TABLE IF NOT EXISTS history_rename_sessions(
- run_id TEXT PRIMARY KEY, expires REAL NOT NULL);
+ run_id TEXT PRIMARY KEY, expires REAL NOT NULL, session_key TEXT);
 """
 
 
@@ -122,21 +122,26 @@ class Bridge:
                     if not row:
                         raise Stop('The selected test video is not a verified historical chat in this channel')
                     s.db.execute("INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)",(self.cid,video_id))
+                    s.db.execute("UPDATE history_rename_items SET chat_status='pending',reason='include_verified',updated=? WHERE channel_id=? AND video_id=? AND chat_status='verified'",(time.time(),self.cid,video_id))
                 else:
                     s.db.execute("INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) SELECT channel_id,id FROM videos WHERE channel_id=? AND history=1 AND state='verified' AND topic IS NOT NULL AND chat IS NOT NULL", (self.cid,))
+                    s.db.execute("UPDATE history_rename_items SET chat_status='pending',reason='include_verified',updated=? WHERE channel_id=? AND chat_status='verified'",(time.time(),self.cid))
             elif video_id:
                 raise Stop('--video requires --include-verified for a one-item history check')
             if s.db.execute('SELECT 1 FROM history_rename_sessions WHERE run_id=? AND expires>?', (run,time.time())).fetchone():
                 raise Stop('A rename bridge is already active for this run')
-            s.db.execute('INSERT OR REPLACE INTO history_rename_sessions VALUES(?,?)', (run,time.time()+120))
+            s.db.execute('INSERT OR REPLACE INTO history_rename_sessions(run_id,expires,session_key) VALUES(?,?,?)', (run,time.time()+120,self.key))
         self.notebook = s.channel(self.cid)['notebook']
 
     def guard(self):
         with self.s.tx():
+            session = self.s.db.execute('SELECT session_key,expires FROM history_rename_sessions WHERE run_id=?', (self.run,)).fetchone()
+            if not session or session['expires'] <= time.time() or session['session_key'] != self.key:
+                raise Stop('This rename bridge has been superseded; stop the old worker')
             self.s.check_lease(self.run)
             if self.s.pause_for(self.cid):
                 raise Stop('Paused; stop the external worker')
-            self.s.db.execute('UPDATE history_rename_sessions SET expires=? WHERE run_id=?', (time.time()+120,self.run))
+            self.s.db.execute('UPDATE history_rename_sessions SET expires=? WHERE run_id=? AND session_key=?', (time.time()+120,self.run,self.key))
 
     def pace(self):
         self.guard()
@@ -226,8 +231,9 @@ class Bridge:
 
     def close(self):
         with self.s.tx():
-            self.s.db.execute('DELETE FROM history_rename_sessions WHERE run_id=?',(self.run,))
-        self.s.cleanup(self.run)
+            deleted = self.s.db.execute('DELETE FROM history_rename_sessions WHERE run_id=? AND session_key=?',(self.run,self.key)).rowcount
+        if deleted:
+            self.s.cleanup(self.run)
 
 
 def serve(s, run, port, include_verified=False, video_id=None):
@@ -281,6 +287,9 @@ def serve(s, run, port, include_verified=False, video_id=None):
                     raise Stop('Invalid request')
                 if self.path=='/next':
                     value=bridge.next()
+                elif self.path=='/heartbeat':
+                    bridge.guard()
+                    value={'alive':True}
                 elif self.path=='/pace':
                     value=bridge.pace()
                 elif self.path=='/result':
@@ -315,6 +324,19 @@ def serve(s, run, port, include_verified=False, video_id=None):
         bridge.close()
 
 
+def auto_run(s):
+    rows = list(s.db.execute(
+        "SELECT r.id FROM runs r JOIN lease l ON l.run_id=r.id "
+        "WHERE r.mode='history' AND r.archive_mode='extension' AND r.finished=0 AND l.expires>? "
+        "ORDER BY r.started DESC", (time.time(),)
+    ))
+    if not rows:
+        raise Stop('没有找到可启动的历史扩展任务；请先开始一个 extension 历史任务')
+    if len(rows) != 1:
+        raise Stop('找到多个可启动的历史扩展任务；请使用明确的 RUN 编号')
+    return rows[0]['id']
+
+
 def dispatch(s,args):
     if args.operation=='configure':
         if not args.channel:
@@ -325,7 +347,10 @@ def dispatch(s,args):
     if args.operation=='enable':
         return enable(s,args.run)
     if args.operation=='serve':
-        return serve(s,args.run,args.port,args.include_verified,args.video)
+        run = auto_run(s) if args.auto else args.run
+        if not run:
+            raise Stop('请提供 RUN 编号，或使用 --auto')
+        return serve(s,run,args.port,args.include_verified,args.video)
     if args.operation=='review':
         if not args.video or not args.reason or len(args.reason)>128:
             raise Stop('--video and a short --reason are required')

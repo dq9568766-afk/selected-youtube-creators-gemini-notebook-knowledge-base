@@ -18,7 +18,22 @@ export async function pageAction(action, args) {
     }
     return [...found].filter(visible);
   };
-  const deepText = el => [el?.textContent || '', el?.shadowRoot?.textContent || '', ...all('*',el).map(node => node.shadowRoot?.textContent || '')].join(' ').replace(/\s+/g,' ').trim();
+  const deepText = el => {
+    if (!el) return '';
+    const parts = [el.textContent || ''];
+    const pending = el.shadowRoot ? [el.shadowRoot] : [];
+    const visited = new Set();
+    while (pending.length) {
+      const root = pending.pop();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      parts.push(root.textContent || '');
+      for (const node of root.querySelectorAll?.('*') || []) {
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+      }
+    }
+    return parts.join(' ').replace(/\s+/g,' ').trim();
+  };
   const one = (items, reason = 'ui_changed') => {
     if (items.length !== 1) throw new Error(reason);
     return items[0];
@@ -109,15 +124,32 @@ export async function pageAction(action, args) {
   }
   const setInput = (field,value) => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(field,value);
-    field.dispatchEvent(new Event('input',{bubbles:true}));
-    field.dispatchEvent(new Event('change',{bubbles:true}));
+    field.focus?.();
+    const InputEventCtor = globalThis.InputEvent || Event;
+    field.dispatchEvent(new InputEventCtor('input',{bubbles:true,composed:true,inputType:'insertText',data:value}));
+    field.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
+    field.blur?.();
   };
   if (action === 'chat-rename') {
     chatEvidence();
     const dialog = await openChatDialog();
     if (dialogField(dialog).value !== args.old_chat_title && dialogField(dialog).value !== args.title) throw new Error('save_unverified');
-    setInput(dialogField(dialog),args.title);
-    button(['重命名','Rename'],dialog).click();
+    const field = dialogField(dialog);
+    setInput(field,args.title);
+    if (field.value !== args.title) throw new Error('save_unverified');
+    const confirm = button(['重命名','Rename'],dialog);
+    if (confirm.disabled || confirm.getAttribute('aria-disabled') === 'true') throw new Error('save_unverified');
+    confirm.focus?.();
+    confirm.click();
+    // Gemini's dialog is a component-managed form. On some UI revisions a
+    // programmatic click updates the button state but does not submit the
+    // form; use Enter only if the same dialog is still visible.
+    await new Promise(resolve => setTimeout(resolve,150));
+    if (visible(dialog)) {
+      field.focus?.();
+      field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true,composed:true}));
+      field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',bubbles:true,composed:true}));
+    }
     await wait(() => !visible(dialog));
     return {saved:true};
   }

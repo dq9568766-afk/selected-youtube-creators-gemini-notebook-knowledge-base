@@ -10,6 +10,8 @@ function fixture() {
     get value(){return this._value;}
     set value(v){this._value=v;}
     getClientRects(){return [{}];}
+    focus(){}
+    blur(){}
     dispatchEvent(){}
   }
   const field=new Input();

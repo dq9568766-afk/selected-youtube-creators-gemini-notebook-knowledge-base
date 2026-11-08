@@ -48,6 +48,11 @@ class ChannelLeaseTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop):
             self.s.begin('history', channel_id='b')
 
+    def test_channel_status_ignores_another_channel_lease(self):
+        self.s.begin('history', channel_id='a')
+        self.assertFalse(self.s.status(False, 'b')['busy'])
+        self.assertTrue(self.s.status(False, 'a')['busy'])
+
     def test_expired_channel_recovery_does_not_touch_other_worker(self):
         a = self.s.begin('history', channel_id='a')['id']
         b = self.s.begin('history', channel_id='b')['id']

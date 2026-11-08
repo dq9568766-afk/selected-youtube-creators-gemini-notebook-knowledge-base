@@ -72,6 +72,39 @@ class HistoryRenameTests(unittest.TestCase):
         row=self.s.db.execute('SELECT chat_status FROM history_rename_items WHERE channel_id=? AND video_id=?',(CID,second['id'])).fetchone()
         self.assertEqual(row['chat_status'],'pending')
 
+    def test_include_verified_requeues_a_previously_verified_chat(self):
+        hr.enable(self.s, self.run)
+        item = self.generate()
+        bridge = hr.Bridge(self.s, self.run)
+        job = bridge.next()
+        self.submit_chat(bridge, job)
+        bridge.close()
+        self.run = self.s.begin('history', channel_id=CID, run_id=self.run)['id']
+
+        recheck = hr.Bridge(self.s, self.run, include_verified=True, video_id=item['id'])
+        row = self.s.db.execute(
+            'SELECT chat_status,reason FROM history_rename_items WHERE channel_id=? AND video_id=?',
+            (CID, item['id']),
+        ).fetchone()
+        self.assertEqual(tuple(row), ('pending', 'include_verified'))
+        self.assertEqual(recheck.next()['video_id'], item['id'])
+        recheck.close()
+
+    def test_expired_bridge_cannot_touch_a_new_bridge_instance(self):
+        hr.enable(self.s, self.run)
+        self.generate()
+        old = hr.Bridge(self.s, self.run)
+        old.next()
+        self.s.db.execute('UPDATE history_rename_sessions SET expires=0 WHERE run_id=?', (self.run,))
+        new = hr.Bridge(self.s, self.run)
+        with self.assertRaisesRegex(ytg.Stop, 'superseded'):
+            old.guard()
+        old.close()
+        self.assertIsNotNone(self.s.db.execute(
+            'SELECT 1 FROM history_rename_sessions WHERE run_id=?', (self.run,)
+        ).fetchone())
+        new.close()
+
     def submit_chat(self,bridge,job,**overrides):
         data={'kind':'chat','status':'verified','video_id':job['video_id'],'title':job['title'],'account':ACCOUNT,'notebook':BOOK,'chat':job['chat'],'video_checked':True,'summary_present':True,'membership_checked':True,'old_chat_title':'old','verification_phase':'readback'}
         data.update(overrides)
@@ -195,6 +228,7 @@ class HistoryRenameTests(unittest.TestCase):
             self.assertIn('video_id',job)
             self.assertNotIn('summary',job)
             self.assertNotIn('prompt',job)
+            self.assertEqual(request('/heartbeat',info['pairing']),{'alive':True})
             self.assertTrue(request('/release',info['pairing'])['released'])
             proc.communicate(timeout=5)
             self.assertEqual(proc.returncode,0)

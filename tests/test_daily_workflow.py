@@ -176,6 +176,32 @@ class DailyWorkflowTests(unittest.TestCase):
         self.assertFalse(any(url.endswith('/shorts') for url in calls))
         self.assertIsNone(self.s.db.execute('SELECT 1 FROM videos WHERE id=?', (short['id'],)).fetchone())
 
+    def test_scan_excludes_explicit_members_only_entries_without_membership(self):
+        self.s.configure_channel(CID, membership_status='no')
+        member = {
+            'id': 'membr000001', 'title': '会员视频',
+            'upload_date': '20261029', 'availability': 'members_only',
+        }
+
+        def fetch(url, *args, **kwargs):
+            return {'channel_id': CID, 'entries': [member] if url.endswith('/videos') else []}
+
+        result = ytg.scan(self.s, CID, fetch=fetch)
+        self.assertEqual(result['tabs'][0]['excluded_members'], 1)
+        self.assertIsNone(self.s.db.execute(
+            'SELECT 1 FROM videos WHERE channel_id=? AND id=?', (CID, member['id'])
+        ).fetchone())
+
+    def test_initial_inventory_preserves_release_date(self):
+        self.s.db.execute('UPDATE channels SET initialized=0')
+        entry = {'id': 'relse000001', 'title': '有发布日期', 'release_date': '20261028'}
+
+        def fetch(url, *args, **kwargs):
+            return {'channel_id': CID, 'entries': [entry] if url.endswith('/videos') else []}
+
+        ytg.scan(self.s, CID, fetch=fetch)
+        self.assertEqual(self.s.video(CID, entry['id'])['published'], '20261028')
+
     def test_missing_inventory_is_explicit_review(self):
         vid = self.add(1, True)
         ytg.scan(self.s, CID, full=True, fetch=self.fetch)

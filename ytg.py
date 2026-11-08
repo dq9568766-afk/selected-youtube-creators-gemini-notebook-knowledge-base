@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS videos(
  found INTEGER NOT NULL, seen TEXT NOT NULL, missing INTEGER NOT NULL DEFAULT 0,
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
  ('pending','reserved','submitting','submitted','summarized','renamed','verified','uncertain','blocked','deferred')),
- chat TEXT UNIQUE, topic TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
+ chat TEXT UNIQUE, topic TEXT, topic_source TEXT, topic_status TEXT NOT NULL DEFAULT 'pending',
+ final_title TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
   title_source TEXT,
  PRIMARY KEY(channel_id,id));
 CREATE INDEX IF NOT EXISTS videos_owner_state ON videos(owner,state,found);
@@ -103,6 +104,10 @@ COLLECT_REASONS = {'generation_timeout','submission_unconfirmed','chat_unidentif
 RENAME_STRATEGIES = {'serial', 'extension'}
 TITLE_FORMATS = {'original', 'topic', 'date-topic'}
 MEMBERSHIP_STATUSES = {'yes', 'no', 'unknown'}
+CONFIRMED_MEMBERSHIP_STATUSES = {'yes', 'no'}
+MEMBERS_ONLY_AVAILABILITIES = {
+    'members_only', 'member_only', 'subscriber_only', 'premium_only',
+}
 
 class Stop(Exception):
     pass
@@ -148,6 +153,8 @@ def title_for(row, topic=None):
     configured = row['title_format'] if 'title_format' in row.keys() else None
     if configured == 'original':
         return row['title']
+    if row['final_title']:
+        return row['final_title']
     topic = topic or row['topic']
     if not topic or not re.fullmatch(r'[\u3400-\u4dbf\u4e00-\u9fff]{1,5}', topic):
         raise Stop('Topic must contain 1–5 Han characters')
@@ -163,6 +170,86 @@ def title_for(row, topic=None):
         return f"{published}-{topic}-{row['title']}"
     prefix = f"{date_value(row['published'])}-" if row['published'] else ''
     return f"{prefix}{topic}-{row['title']}"
+
+
+def topic_from_title(title):
+    """Return a conservative 1–5 Han-character candidate from an original title."""
+    text = re.sub(r'（[^）]*）|\([^)]*\)|\[[^]]*\]', ' ', title or '')
+    text = re.sub(r'^(王局拍案|新闻特写|新闻大写|王志安说|王志安：|王局：)\s*', '', text)
+    runs = re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff]{1,}', text)
+    ignored = {'今天','最新消息','完整版','现场直播','王局拍案','新闻特写','新闻大写'}
+    for run in runs:
+        if run in ignored or len(run) > 5:
+            continue
+        return run
+    return None
+
+
+def extract_topics(s, cid):
+    """Batch-generate local title-based topic candidates; never calls a service."""
+    channel = s.channel(cid)
+    if channel['title_format'] == 'original':
+        return {'channel_id': cid, 'skipped': True, 'reason': 'original_title_format'}
+    changed = review = 0
+    with s.tx():
+        rows = s.db.execute("SELECT id,title FROM videos WHERE channel_id=? AND history=1", (cid,)).fetchall()
+        for row in rows:
+            topic = topic_from_title(row['title'])
+            if not topic:
+                s.db.execute("UPDATE videos SET topic=NULL,topic_source='title_rule',topic_status='review',final_title=NULL WHERE channel_id=? AND id=?", (cid,row['id']))
+                review += 1
+                continue
+            s.db.execute("UPDATE videos SET topic=?,topic_source='title_rule',topic_status='rule_generated',final_title=NULL WHERE channel_id=? AND id=?", (topic,cid,row['id']))
+            changed += 1
+    return {'channel_id': cid, 'changed': changed, 'review': review}
+
+
+def generate_titles(s, cid):
+    """Persist current titles after topic/date data is available."""
+    channel = s.channel(cid)
+    if channel['title_format'] == 'original':
+        return {'channel_id': cid, 'generated': 0, 'skipped': True}
+    generated = review = 0
+    with s.tx():
+        rows = s.db.execute("SELECT * FROM videos WHERE channel_id=? AND history=1", (cid,)).fetchall()
+        for row in rows:
+            try:
+                value = title_for(row)
+            except Stop:
+                s.db.execute("UPDATE videos SET final_title=NULL,topic_status='review' WHERE channel_id=? AND id=?", (cid,row['id']))
+                review += 1
+                continue
+            s.db.execute("UPDATE videos SET final_title=? WHERE channel_id=? AND id=?", (value,cid,row['id']))
+            generated += 1
+    return {'channel_id': cid, 'generated': generated, 'review': review}
+
+
+def history_pipeline(s, cid, full=True):
+    """Run inventory, local topic extraction, date backfill, and title generation."""
+    import backfill
+    require_channel_config(s, cid)
+    inventory = scan(s, cid, full=full)
+    if not inventory['complete']:
+        return {'channel_id': cid, 'inventory': inventory, 'complete': False}
+    channel = s.channel(cid)
+    date_report = None
+    if channel['title_format'] == 'date-topic':
+        date_report = backfill.start(s, cid)
+        job = date_report['id']
+        while not date_report['complete']:
+            date_report = backfill.report(s, job)
+            if date_report['complete']:
+                break
+            if date_report.get('status') == 'review':
+                break
+            backfill.step(s, job)
+        if not date_report['complete']:
+            return {'channel_id': cid, 'inventory': inventory, 'date_backfill': date_report,
+                    'title_generation': {'generated': 0, 'review': date_report.get('total', 0)},
+                    'complete': False}
+    titles = generate_titles(s, cid)
+    return {'channel_id': cid, 'inventory': inventory, 'date_backfill': date_report,
+            'title_generation': titles, 'complete': titles['review'] == 0}
 
 
 def metadata_fresh(row):
@@ -258,6 +345,15 @@ class Store:
                 columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
                 if 'title_source' not in columns:
                     self.db.execute('ALTER TABLE videos ADD COLUMN title_source TEXT')
+        columns = {r['name'] for r in self.db.execute('PRAGMA table_info(videos)')}
+        with self.tx():
+            for name, declaration in [
+                ('topic_source', 'TEXT'),
+                ('topic_status', "TEXT NOT NULL DEFAULT 'pending'"),
+                ('final_title', 'TEXT'),
+            ]:
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE videos ADD COLUMN {name} {declaration}')
         run_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
         with self.tx():
             if 'archive_mode' not in run_columns:
@@ -325,6 +421,7 @@ class Store:
         import history_rename
         self.db.executescript(history_rename.SCHEMA)
         history_rename_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(history_rename_items)')}
+        history_rename_session_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(history_rename_sessions)')}
         with self.tx():
             for name, declaration in [
                 ('recovery_attempts', 'INTEGER NOT NULL DEFAULT 0'),
@@ -333,6 +430,8 @@ class Store:
             ]:
                 if name not in history_rename_columns:
                     self.db.execute(f'ALTER TABLE history_rename_items ADD COLUMN {name} {declaration}')
+            if 'session_key' not in history_rename_session_columns:
+                self.db.execute('ALTER TABLE history_rename_sessions ADD COLUMN session_key TEXT')
         # Preserve an existing worker's ownership and expiry during the upgrade.
         with self.tx():
             if 'singleton' in {r['name'] for r in self.db.execute('PRAGMA table_info(lease)')}:
@@ -548,7 +647,7 @@ class Store:
             channel['config_confirmed']
             and channel['rename_strategy'] in RENAME_STRATEGIES
             and channel['title_format'] in TITLE_FORMATS
-            and channel['membership_status'] in MEMBERSHIP_STATUSES
+            and channel['membership_status'] in CONFIRMED_MEMBERSHIP_STATUSES
         )
         return {
             'channel_id': cid,
@@ -584,7 +683,7 @@ class Store:
         confirmed = int(all(values[name] in allowed for name, allowed in (
             ('rename_strategy', RENAME_STRATEGIES),
             ('title_format', TITLE_FORMATS),
-            ('membership_status', MEMBERSHIP_STATUSES),
+            ('membership_status', CONFIRMED_MEMBERSHIP_STATUSES),
         )))
         with self.tx():
             self.db.execute(
@@ -677,6 +776,12 @@ class Store:
             not os.environ.get('YOUTUBE_DATA_API_KEY') or cid not in API_TITLE_CHANNELS
         ):
             self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
+
+    @staticmethod
+    def _member_only_entry(entry):
+        availability = str(entry.get('availability') or '').strip().lower()
+        access = str(entry.get('access') or '').strip().lower()
+        return availability in MEMBERS_ONLY_AVAILABILITIES or access in MEMBERS_ONLY_AVAILABILITIES
 
 
     def check_lease(self,run):
@@ -1102,9 +1207,9 @@ class Store:
                 if v['state']!='submitted' or evidence!='youtube-content-complete':
                     raise Stop('Require a completed, content-backed response in the linked chat')
                 configured = v['title_format']
-                topic = None if configured == 'original' else value
+                topic = None if configured == 'original' else (value or v['topic'])
                 title_for(v, topic)
-                self.db.execute("UPDATE videos SET state='summarized',topic=? WHERE channel_id=? AND id=?",(topic,*args))
+                self.db.execute("UPDATE videos SET state='summarized',topic=?,final_title=NULL,topic_status=CASE WHEN ? IS NULL THEN topic_status ELSE 'confirmed' END WHERE channel_id=? AND id=?",(topic, value, *args))
                 self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
                 if current_run['mode']=='history' and current_run['archive_mode']=='extension':
                     self.db.execute('INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)',args)
@@ -1220,9 +1325,14 @@ class Store:
 
     def status(self,verbose=True,channel_id=None):
         if not verbose:
-            lease = self.db.execute('SELECT run_id,expires FROM lease WHERE expires>?',(time.time(),)).fetchone()
+            lease_query = 'SELECT run_id,expires FROM lease WHERE expires>?'
+            lease_params = [time.time()]
+            if channel_id:
+                lease_query += " AND (scope='*' OR scope=?)"
+                lease_params.append(channel_id)
+            lease = self.db.execute(lease_query, lease_params).fetchone()
             return {'pause':self.setting('pause'), 'pauses':self.pause_status(), 'busy':bool(lease),
-                    'leases':[dict(x) for x in self.db.execute('SELECT scope,run_id,expires FROM lease WHERE expires>?',(time.time(),))],
+                    'leases':[dict(x) for x in self.db.execute(lease_query.replace('run_id,expires','scope,run_id,expires'), lease_params)],
                     'daily_due':self.daily_due(channel_id), 'channel_id':channel_id,
                     'daily_used':self.budget_used(channel_id),
                     'coordinator':self.coordinator_status(),
@@ -1451,18 +1561,22 @@ def scan(s,cid,full=False,fetch=extract,run=None):
             count = 0
             with s.tx():
                 if run: s.check_lease(run)
+                excluded_members = 0
                 for entry in entries:
                     if not entry:
                         raise Stop('Null entry makes the inventory incomplete')
+                    if c['membership_status'] == 'no' and s._member_only_entry(entry):
+                        excluded_members += 1
+                        continue
                     if c['initialized']:
                         s.insert(cid,entry,stamp,False)
                     else:
                         if not re.fullmatch(r'[A-Za-z0-9_-]{11}',entry.get('id') or ''):
                             raise Stop('Invalid video id in inventory')
-                        s.db.execute('INSERT OR REPLACE INTO initial_inventory VALUES(?,?,?,?,?)',(cid,tab,entry['id'],entry.get('title') or entry['id'],entry.get('upload_date')))
+                        s.db.execute('INSERT OR REPLACE INTO initial_inventory VALUES(?,?,?,?,?)',(cid,tab,entry['id'],entry.get('title') or entry['id'],entry.get('release_date') or entry.get('upload_date')))
                     count += 1
                 s.db.execute('INSERT OR REPLACE INTO scans VALUES(?,?,?,?,?)',(cid,tab,count,'ok',stamp))
-            results.append({'tab':tab,'status':'ok','count':count,
+            results.append({'tab':tab,'status':'ok','count':count,'excluded_members':excluded_members,
                             'scope':'recent' if windowed else 'full'})
         except Exception as exc:
             category = metadata_failure(exc)
@@ -1504,9 +1618,15 @@ def scan(s,cid,full=False,fetch=extract,run=None):
         else:
             date_coverage = 'recent-window'
     date_status = s.date_backfill_status(cid)
+    topic_result = extract_topics(s, cid) if complete and (full or not c['initialized']) else None
+    title_result = generate_titles(s, cid) if complete and (full or not c['initialized']) else None
     result = {'channel_id':cid,'complete':complete,'tabs':results,
               'date_coverage':date_coverage,'date_backfill':date_status,
               'excluded_tabs':['shorts']}
+    if topic_result is not None:
+        result['topic_extraction'] = topic_result
+    if title_result is not None:
+        result['title_generation'] = title_result
     if date_status['blocked']:
         result['next_action'] = date_status['next_action']
     return result
@@ -1677,14 +1797,15 @@ def main(argv=None):
     a.add_argument('--rename-strategy', choices=sorted(RENAME_STRATEGIES))
     a.add_argument('--title-format', choices=sorted(TITLE_FORMATS))
     a.add_argument('--membership', choices=sorted(MEMBERSHIP_STATUSES))
-    a = sub.add_parser('pace'); a.add_argument('kind',choices=['access'],help='Claim a slot before one non-submission Gemini UI action'); a.add_argument('--run',help='Current run that owns the account coordination slot')
+    a = sub.add_parser('pace'); a.add_argument('kind',choices=['access'],help='Claim a slot before one non-submission Gemini UI action'); a.add_argument('--run',required=True,help='Current run that owns the account coordination slot')
     a = sub.add_parser('metadata-backfill'); a.add_argument('operation',choices=['start','run','status','report','resume']); a.add_argument('job',nargs='?'); a.add_argument('--channel'); a.add_argument('--confirmed',action='store_true')
     a = sub.add_parser('add'); a.add_argument('url')
     a = sub.add_parser('notebook'); a.add_argument('channel'); a.add_argument('url'); a.add_argument('--replace-missing', action='store_true', help='Replace a mapping only after the old notebook was verified missing in Gemini'); a.add_argument('--replace-verified', action='store_true', help='Replace an existing mapping after the target account and Notebook were verified in the visible Gemini UI'); a.add_argument('--evidence', help='Required with --replace-verified: account-notebook-checked')
     a = sub.add_parser('scan'); a.add_argument('--channel'); a.add_argument('--full',action='store_true'); a.add_argument('--run')
+    a = sub.add_parser('history-pipeline'); a.add_argument('--channel', required=True); a.add_argument('--full',action='store_true')
     a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true'); a.add_argument('--channel'); a.add_argument('--policy',choices=['strict','collect-first'],default='strict'); a.add_argument('--run')
     a.add_argument('--archive',choices=['serial','extension'],default=None,help='History only: batch rename in the external extension')
-    a = sub.add_parser('history-rename'); a.add_argument('operation',choices=['configure','enable','serve','report','review']); a.add_argument('run',nargs='?'); a.add_argument('--channel'); a.add_argument('--account'); a.add_argument('--port',type=int,default=8765); a.add_argument('--include-verified',action='store_true'); a.add_argument('--video'); a.add_argument('--reason')
+    a = sub.add_parser('history-rename'); a.add_argument('operation',choices=['configure','enable','serve','report','review']); a.add_argument('run',nargs='?'); a.add_argument('--auto',action='store_true',help='Serve the only active extension history run'); a.add_argument('--channel'); a.add_argument('--account'); a.add_argument('--port',type=int,default=8765); a.add_argument('--include-verified',action='store_true'); a.add_argument('--video'); a.add_argument('--reason')
     a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
@@ -1716,7 +1837,9 @@ def main(argv=None):
                     title_format=args.title_format,
                     membership_status=args.membership,
                 ))
-        elif args.cmd=='pace': result=s.browser_access(args.kind,owner=args.run)
+        elif args.cmd=='pace':
+            s.check_lease(args.run)
+            result=s.browser_access(args.kind,owner=args.run)
         elif args.cmd=='metadata-backfill':
             import backfill
             if args.operation=='start':
@@ -1755,6 +1878,8 @@ def main(argv=None):
             for cid in ids:
                 require_channel_config(s, cid)
             result=[scan(s,c,args.full or now().weekday()==0,run=args.run) for c in ids]
+        elif args.cmd=='history-pipeline':
+            result=history_pipeline(s,args.channel,full=True)
         elif args.cmd=='begin':
             if args.channel:
                 require_channel_config(s, args.channel)

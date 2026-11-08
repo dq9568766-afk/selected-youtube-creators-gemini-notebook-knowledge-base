@@ -4,11 +4,12 @@
 <main><h1>历史视频批量改名</h1>
 <p>只处理本机服务提供的历史名单。请确认当前浏览器登录的是登记账号，并暂停本频道其他 Gemini 操作。</p>
 <label>选择本机服务生成的配对文件 <input id="pairing" type="file" accept=".json"></label>
-<p id="mapping">尚未连接</p>
+<div class="actions"><button id="nativeStart">启动本机服务</button><button id="nativeStop">停止本机服务</button></div>
+<p id="mapping">本机服务：未连接</p>
 <label><input id="confirmed" type="checkbox">我已核对当前浏览器账号及Gemini 笔记本，并暂停本频道其他操作</label>
 <div class="actions"><button id="preview">只检查一条</button><button id="one">改名一条</button><button id="start">开始批量改名</button><button id="stop" disabled>停止</button></div>
 <p>首次使用先检查一条，再改名一条。批量执行时保持此工具页打开；页面变化、暂时加载失败或保存后读回异常时，工具会从登记笔记本自动重开并重做核验，最多两次；仍无法确认才停止并保留待处理。</p>
 <output id="status" role="status">等待配对文件</output>
 <p id="counts"></p>
-<details><summary>运行说明</summary><p>总结仍在 Gemini 页面生成。工具只使用页面菜单，不发送提示词、不调用 Google 私有接口、不保存总结正文。NotebookLM 中的 Gemini 对话来源不能独立改名，是否同步需另行核对。</p><p>本工具会在当前浏览器打开专用工作标签。遇到登录、验证码、账号不符或连续两次自动恢复仍无法确认时，会显示失败步骤，项目保留待处理。关闭本机服务后，再按项目规程恢复其他 Gemini 操作。</p></details>
+<details><summary>运行说明</summary><p>总结仍在 Gemini 页面生成。工具只使用页面菜单，不发送提示词、不调用 Google 私有接口、不保存总结正文。NotebookLM 中的 Gemini 对话来源不能独立改名，是否同步需另行核对。</p><p>首次使用请运行扩展目录中的 install_native_host.cmd，完成一次本机组件安装。以后点击“启动本机服务”即可，不再需要 CMD 或选择配对文件；选择文件仍保留为备用方式。</p></details>
 </main><script type="module" src="panel.js"></script></html>

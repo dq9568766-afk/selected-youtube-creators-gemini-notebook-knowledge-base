@@ -2,9 +2,9 @@
 
 本文将项目流程与智能体工具能力分开。技能文件描述共同规则；每个平台只负责提供文件、命令行和 Gemini 网页会话的入口。平台具备某项工具，不代表当前用户环境已经配置或登录。
 
-2026-11-03 用户已授权历史批量改名例外：生成继续使用 Codex 内置浏览器，改名阶段可切到本项目外部 Chrome 扩展；增量不变。此例外不是浏览器恢复的替代路径，不得在内置浏览器生成故障时用外部浏览器继续发送。扩展仅改 Gemini 聊天，详细入口、租约及安装确认见 [HISTORY_RENAME.md](HISTORY_RENAME.md)。
+平台规则已统一：Codex 使用 Codex 内置浏览器；WorkBuddy 的 Gemini 生成、发送、重试、恢复、普通核验和历史改名扩展统一使用指定外部 Chrome。扩展仅改 Gemini 聊天，详细入口、租约及安装确认见 [HISTORY_RENAME.md](HISTORY_RENAME.md)。
 
-WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验和普通页面核验优先使用 WorkBuddy 内置浏览器。由于 WorkBuddy 内置浏览器无法加载扩展，只有显式选择历史扩展归档时，才在外部 Windows 浏览器加载并运行 `extensions/history-renamer`。外部浏览器不承担 Gemini 生成、重试、恢复或替代内置浏览器的故障处理。
+WorkBuddy 适配：生成、发送、重试、账号/Notebook 核验、普通页面核验和历史扩展统一使用 WorkBuddy 指定的外部 Chrome 执行浏览器。扩展归档期间不得与 Gemini 生成并行。Codex 仍固定使用 Codex 内置浏览器。
 
 适配信息核对日期：2026-10-28。平台的安装入口和工具能力可能变化，分发前应复核对应官方文档。
 
@@ -29,6 +29,9 @@ CLI 中 `summary`、`verify` 不是独立命令，而是 `step` 的 action。真
 ## Codex
 
 - 每次开始或恢复队列处理，先明确选用 Codex 内置浏览器并打开登记的 Gemini Notebook 工作标签，再运行队列状态命令。不要假定浏览器面板、工具存在或旧回合标签就代表本轮已建立可用会话；按 WORKER 验证页面可读和交互后才继续。
+- Codex 内置 Gemini 页面已验证可以读取无障碍/DOM 结构，能识别文本输入区、Google 应用按钮和当前账号。Codex 操作 Gemini 时优先使用 DOM/可访问性树和语义定位：role、accessible name、label、placeholder、稳定文本或 URL。每次操作后重新读取 DOM 验证结果，不以截图变化或点击调用返回作为成功证据。
+- Gemini 部分控件位于 Shadow DOM，低层数字索引点击可能返回无法检查 Shadow Root。遇到此情况，若当前浏览器工具提供 Playwright/语义 locator，改用它定位；只有 DOM/语义接口无法操作时才有限度使用视觉或坐标，并在操作后回到 DOM 核验。该限制不证明 Gemini 或账号不可用。
+- Codex 队列默认使用 Codex 自带的浏览器插件/内置浏览器作为 Gemini 入口。不得用外部 Chrome 承担 Gemini 生成、发送、重试、恢复或普通核验；外部 Windows Chrome 仅在显式启用 `history-renamer` 历史改名归档时使用。
 - 新频道若 `preflight` 返回 `notebook_setup.registered=false`，先在 Codex 内置浏览器创建并核验该频道的 Gemini Notebook，再登记 URL；登记成功并重新通过页面核验前，不得开始扫描后的总结。
 - 将本项目目录作为 canonical 技能源；Codex 个人技能入口可指向项目根目录，避免维护第二份内容。目录移动后需更新该入口。
 - 使用 Codex 当前可用且已登录的浏览器会话。实际会话是否能访问 Gemini，以当前 UI 和工具检查为准。
@@ -40,12 +43,19 @@ CLI 中 `summary`、`verify` 不是独立命令，而是 `step` 的 action。真
 - 使用项目根目录的打包器生成 WorkBuddy 包：`python workbuddy_package.py --output PATH`。它只复制公开规则、脚本和扩展，不复制任务数据库、浏览器资料、凭据或摘要。
 - 上传或安装生成目录中的 `SKILL.md` 所在目录，不要把 `%LOCALAPPDATA%/youtube-gemini-channel-summarizer/tasks.sqlite3` 打包进去。包内脚本位于 `scripts/`，执行时保持该包的项目根目录或明确使用 `python scripts/ytg.py`。
 - 频道首次确认完成后，用 `python scripts/ytg.py channel-config CHANNEL_ID --rename-strategy RENAME_STRATEGY --title-format TITLE_FORMAT --membership MEMBERSHIP` 持久化选择；可选值分别是 `serial`/`extension`、`original`/`topic`/`date-topic`、`yes`/`no`/`unknown`。该命令不启动扫描、不发送 Gemini。
-- 仅在当前 WorkBuddy 会话确实提供可操作 Gemini 页面、项目文件访问和 shell 时执行队列工作。启动前必须由 WorkBuddy 浏览器完成：打开登记 Notebook、读回完整页面、执行一次无副作用交互并读回结果，同时核对账号和 Notebook。仅有标签标题、URL、9222/CDP 端口或浏览器进程不算通过。
-- 若 Agent Browser、Playwright MCP 或其他合规连接器未安装、未授权、未登录 Gemini，或无法核验 Notebook/聊天证据，则停止队列操作；不得改用外部 Chrome、远程调试、Cookie、Token、浏览器配置文件、Gemini API 或私有 RPC。
-- 上一条限制不影响已明确授权的历史扩展例外：外部 Windows 浏览器只能在 `history-rename serve RUN` 后加载本项目扩展并执行改名/重开/核验；不能用它绕过 WorkBuddy 内置浏览器的生成、发送或恢复门槛。
+- 仅在当前 WorkBuddy 会话确实提供可操作 Gemini 页面、项目文件访问和 shell 时执行队列工作。启动前必须由指定外部 Chrome 执行浏览器完成：打开登记 Notebook、读回完整页面、执行一次无副作用交互并读回结果，同时核对账号和 Notebook。仅有标签标题、URL、9222/CDP 端口或浏览器进程不算通过。
+- WorkBuddy 直接使用指定外部 Chrome 执行浏览器；若该执行浏览器未安装、未授权、未登录 Gemini，或无法核验 Notebook/聊天证据，则停止队列操作。不得使用远程调试、Cookie、Token、浏览器配置文件、Gemini API 或私有 RPC。
+- 历史扩展仍在同一指定外部 Chrome 执行浏览器中按 `history-rename serve RUN` 使用；不得与 Gemini 生成提交并行。该 WorkBuddy 规则不改变 Codex 固定使用内置浏览器的规则。
 - 可先运行只读自检：`python scripts/ytg.py preflight --channel CHANNEL_ID`。该命令永远不会替 WorkBuddy 伪造浏览器通过；返回 `ready:false` 时必须完成页面能力检查后再继续。
 - 若频道标题格式为 `date-topic`，WorkBuddy 必须先读取 `preflight`/`scan` 返回的 `date_backfill`。出现 `blocked=true` 时，不得发送 Gemini；若当前历史 run 持有租约，先 cleanup，再执行 `metadata-backfill start/run/report`，直到 `complete=true`。只有明确 `unavailable` 的日期可以保留 `all_dates_complete=false` 并继续其他视频。
-- 新频道日期补齐完成后，WorkBuddy 必须读取 `preflight.notebook_setup`。若 `registered=false`，优先使用 WorkBuddy 内置浏览器创建并核验频道 Gemini Notebook，再运行 `python scripts/ytg.py notebook CHANNEL_ID NOTEBOOK_URL` 登记；不得用外部 Windows 浏览器创建，也不得在未核验时发送总结。外部浏览器仅保留给显式启用的历史改名扩展。
+- 新频道日期补齐完成后，WorkBuddy 必须读取 `preflight.notebook_setup`。若 `registered=false`，直接在指定外部 Chrome 执行浏览器中创建并核验频道 Gemini Notebook，再运行 `python scripts/ytg.py notebook CHANNEL_ID NOTEBOOK_URL` 登记；不得在未核验时发送总结。
+- WorkBuddy 的 Gemini 操作同样采用 DOM-first：如果指定外部 Chrome 执行浏览器提供 DOM/无障碍树或 Playwright/语义 locator，优先用 role、accessible name、label、placeholder、稳定文本和 URL 定位；每次操作后重新读取页面核验。若当前会话只提供截图，或低层操作无法跨越 Gemini 的 Shadow DOM，才允许有限视觉/坐标降级；降级后必须回到页面/DOM证据，不能以点击返回成功代替核验。
+- 标题格式为 `original` 时跳过主题词和日期流水线；`topic`/`date-topic` 使用 `history-pipeline` 在全量扫描结束后批量生成本地主题词和 `final_title`。`date-topic` 的日期由同一流程自动运行 metadata-backfill。扩展只读取数据库最新标题，不负责主题词提取，不自动启动改名。
+- WorkBuddy 默认直接使用指定的外部 Chrome 执行浏览器完成 Gemini 打开、账号/Notebook核验、生成、发送、重试和普通核验，不再要求用户对当前运行另行授权，也不先在 IAB 中启动任务。`Playwright Browser Automation` 或 `mcp__browser__*` 只有在绑定该执行浏览器时才可使用；独立未登录的 `agent-browser`/Chromium 不得替代它。不得使用 CDP、私有 RPC、Cookie、Token、浏览器配置文件或远程调试。
+- 切换到外部 Chrome 后仍先核对同一账号和登记 Notebook，再用一条 `attach → summary → 改名 → verify` 完整链路验证页面证据；验证失败按当前频道故障暂停，不批量发送。该规则只改变 WorkBuddy，不改变 Codex 固定使用内置浏览器的规则。
+- 先列出指定外部 Chrome 执行浏览器标签并认领当前用户已置前、且 URL 与登记 Notebook 匹配的真实标签；已有可用标签时不得新建后台标签。只有没有可用匹配标签，或原标签已确认失效时，才在同一执行浏览器创建新工作标签。
+- 低层输入调用返回成功，不代表文字已落地。必须重新读取 DOM，确认输入框包含完整视频 URL 和“总结”、发送按钮已出现；若输入仍为空，使用同一外部 Chrome 执行浏览器的键盘焦点/输入通道重试一次，再回读 DOM。提交后确认输入框清空，并出现原消息或“停止回答/生成中”状态后才登记发送成功。
+- 如果 Gemini 已生成完整回复但明确拒答、只说无法理解或没有实际视频内容，归类为 `content_failed`，不走无正文快速重试，也不归类为浏览器故障；执行 `defer --value content_failed --next`。同频道达到项目规定的连续来源失败阈值后，由状态机暂停为 `source_unavailable`，不继续盲目发送。
 - WorkBuddy 技能安装成功不等于已具备浏览器、终端、同一 Windows 用户的 canonical 任务库或 Gemini 登录权限；这些必须分别验证。
 
 ## Claude Code
@@ -70,5 +80,6 @@ CLI 中 `summary`、`verify` 不是独立命令，而是 `step` 的 action。真
 - 首次 `domSnapshot()` 只有 `- main` 时按 WORKER 的观察间隔等加载。实际恢复判据是完整页面内容可读，并且一次无副作用的语义操作（例如打开对话搜索）成功，且操作后的状态可读；标题、标签列表或单次快照不足以证明交互恢复。后续每次动作都以当前 DOM 为依据，不复用旧元素索引。
 - 如果现有聊天的发送结果未知，按当前策略保留证据：strict核对原消息与归属，collect-first可按WORKER登记延期。连接恢复本身不清全局pause，也不授权重发。跨回合确有待保留页面才使用markHandoff，下一回合仍须实测。旧标签不可操作时在同一浏览器建新工作标签；旧标签存在不代表可用。
 - 新标签加载后，先按 WORKER 的观察间隔等待；确认完整 Notebook 内容可读，再执行一次无副作用的页面交互并确认操作后状态可读。标题、URL、标签清单或单次 `- main` 快照都不足以证明可用。此流程能恢复已观测到的旧标签句柄失效，但不能修复浏览器集成底层，也不能保证问题不再出现。新标签仍不能完成读与交互时保留暂停并停止本次尝试，记录可见错误类别供后续排查。
+- Gemini 原生 Notebook 的稳定入口：新建或恢复工作标签后，先打开 `https://gemini.google.com/app`，等待完整页面和侧栏加载，再从侧栏的“笔记本”列表点击数据库登记的 Notebook 链接。不要把直接导航登记 URL 后只出现“笔记本设置”视为已核验；必须读回 Notebook 标题、账号和输入区，并完成一次无副作用交互。该入口顺序适用于 Codex 内置 Browser，不能因此改用外部 Chrome。
 
 给浏览器集成维护者复现时，可报告：同一 Codex 内置浏览器中创建标签并打开 Gemini，确认 DOM 可读且搜索按钮可点击，标记 handoff 结束回合；下一回合 `tabs.list()` 仍含该标签，`tabs.get(id)` 后读取 DOM 报 `browser.user is unavailable`；在同一浏览器创建新标签后读取和点击恢复。当前仅有这些现象，不能归因到 Gemini 网页、账号或网络。此复现用于定位集成问题，不构成队列恢复或解除暂停的证据。

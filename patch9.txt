@@ -1,8 +1,0 @@
-*** Begin Patch
-*** Update File: tests/test_api_titles.py
-@@
--class ApiTitleTests(unittest.TestCase):
--    setUp = fixtures.EfficiencyTests.setUp
--    tearDown = fixtures.EfficiencyTests.tearDown
-+class ApiTitleTests(fixtures.EfficiencyTests):
-*** End Patch

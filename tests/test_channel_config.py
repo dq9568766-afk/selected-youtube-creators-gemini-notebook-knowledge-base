@@ -69,6 +69,16 @@ class ChannelConfigTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop):
             self.store.configure_channel(CID, membership_status='maybe')
 
+    def test_unknown_membership_cannot_confirm_channel_setup(self):
+        result = self.store.configure_channel(
+            CID,
+            rename_strategy='serial',
+            title_format='original',
+            membership_status='unknown',
+        )
+        self.assertEqual(result['config_confirmed'], 0)
+        self.assertFalse(self.store.channel_config(CID)['complete'])
+
     def test_workbuddy_preflight_is_read_only_and_explains_browser_gate(self):
         result = ytg.preflight(self.store, CID)
         self.assertFalse(result['ready'])

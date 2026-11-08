@@ -32,6 +32,7 @@ REFERENCE_FILES = {
     'docs/AGENT_ADAPTERS.md': 'AGENT_ADAPTERS.md',
     'docs/HISTORY_RENAME.md': 'HISTORY_RENAME.md',
     'docs/AUTOMATION_PROMPT.md': 'AUTOMATION_PROMPT.md',
+    'docs/WORKBUDDY_RUNNER.md': 'WORKBUDDY_RUNNER.md',
 }
 SCRIPT_FILES = ('ytg.py', 'backfill.py', 'history_rename.py')
 
@@ -60,9 +61,10 @@ def build(output: Path) -> Path:
 
 这是从项目 canonical 源生成的 WorkBuddy 包。先读取 `@references/PROJECT_RULES.md`、
 `@references/WORKER.md` 和 `@references/AGENT_ADAPTERS.md`。只有 WorkBuddy 当前会话
-确实提供可操作、可读回的 Gemini 内置浏览器页面时，才允许执行生成队列命令；9222/CDP、
-Cookie、Token、浏览器配置文件和私有接口都不构成合规能力。外部 Windows 浏览器只在
-显式启用历史改名扩展时使用，不能替代内置浏览器发送或恢复 Gemini 任务。
+确实提供可操作、可读回的指定外部 Chrome Gemini 页面时，才允许执行生成队列命令；
+9222/CDP、Cookie、Token、浏览器配置文件和私有接口都不构成合规能力。WorkBuddy 的
+Gemini 生成、发送、恢复、普通核验和历史改名扩展统一使用该外部 Chrome；不得另起
+未登录的 Chromium 或独立浏览器替代它。
 
 参考资料：`@references/PROJECT_RULES.md`、`@references/WORKER.md`、
 `@references/AGENT_ADAPTERS.md`、`@references/HISTORY_RENAME.md`。

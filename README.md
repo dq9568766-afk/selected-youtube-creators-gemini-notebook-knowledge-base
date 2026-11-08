@@ -27,6 +27,7 @@
 - **中断了，留着进度接着做。** 记录任务状态和已有聊天，恢复时优先接续；提交不明时按规则保留现场，避免重复发送。
 - **哪条没做成，清清楚楚。** 授权失败后置后，首轮把单条异常列入待复查清单，继续后面的内容；生成数、核验数、延期项分开汇报。
 - **旧内容整理完，新内容也能跟。** 可另配每日增量任务，发现新视频；安装 Skill 本身不会自动开启定时任务。
+- **WorkBuddy 可持续处理。** 使用 `docs/WORKBUDDY_RUNNER.md` 作为连续运行入口，按队列循环处理视频；遇到登录、验证码、配额或未知提交时暂停并保留现场。
 
 ### 🧠 整理完，可以怎么用？
 
@@ -59,7 +60,7 @@ https://github.com/dq9568766-afk/selected-youtube-creators-gemini-notebook-knowl
 python workbuddy_package.py --output C:\path\to\workbuddy-skill
 ```
 
-生成包包含 WorkBuddy 所需的双语元数据、`references/`、`scripts/` 和历史改名扩展；不会复制任务数据库、浏览器登录资料或摘要。WorkBuddy 内置浏览器优先负责 Gemini 生成、发送和核验；由于它不能加载扩展，历史批量改名时才在外部 Windows 浏览器加载本项目扩展。外部浏览器不能替代内置浏览器处理 Gemini 生成或恢复。安装技能不等于 WorkBuddy 已具备可操作的 Gemini 浏览器，仍需通过适配指南中的页面能力检查。
+生成包包含 WorkBuddy 所需的双语元数据、`references/`、`scripts/` 和历史改名扩展；不会复制任务数据库、浏览器登录资料或摘要。WorkBuddy 统一使用指定外部 Chrome 执行浏览器负责 Gemini 生成、发送和核验；历史批量改名时也在该外部 Chrome 中运行本项目扩展。安装技能不等于 WorkBuddy 已具备可操作的 Gemini 浏览器，仍需通过适配指南中的页面能力检查。
 
 如果标题格式选择发布日期，项目会先建立视频清单，再检查日期覆盖率。日期未补齐前不会进入 Gemini 总结；需先完成 `metadata-backfill`，确认报告 `complete=true` 后再继续。
 
@@ -70,7 +71,7 @@ python workbuddy_package.py --output C:\path\to\workbuddy-skill
 把示例地址替换成你想整理的频道，再发给智能体：
 
 ```text
-使用 $youtube-creator-gemini-notebook-knowledge-base，整理这个频道：
+使用 $dq-youtube-creator-gemini-notebook-knowledge-base，整理这个频道：
 https://www.youtube.com/@channel
 
 采集公开历史视频，允许单条失败后置，使用 collect-first。
@@ -84,7 +85,7 @@ https://www.youtube.com/@channel
 
 - **需要智能体持续执行。** 电脑关机、应用退出、登录失效或额度耗尽时，不能保证继续处理；暂停不代表后台还在跑。
 - **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文、确认停止且页面未跳转或中断后可在当前输入框重发一次，重试前不要求聊天地址，再等20秒。未完成则停止并延期，首次已有正文但未完成不重发。重试也占增量提交预算；不同视频和其他 Gemini 页面动作间隔至少15秒。
-- **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少2分钟；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
+- **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少90秒；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
 - **页面操作节流。** Gemini 页面动作与不同视频提交至少间隔15秒。非提交动作由 `python ytg.py pace access --run RUN` 领取账号时间槽；协调权只覆盖当前页面动作窗口，其他频道可以并行等待 Gemini 生成；`arm` 和 `retry` 自动检查提交间隔。
 - **少留一份数据。** 只采集公开元数据，不下载视频、音频或字幕，不调用 Gemini API；摘要留在 Gemini，本地只记最小任务状态。
 - **总结仍需判断。** 隔离自动测试覆盖队列规则；网页实测范围见 [验证记录](docs/VALIDATION.md)。模型可能遗漏或误读，重要内容请回看原视频。
@@ -151,7 +152,7 @@ You need Windows, Python 3.11+, yt-dlp, and an agent with file, shell, and brows
 Replace the example URL, then ask:
 
 ```text
-Use $youtube-creator-gemini-notebook-knowledge-base for:
+Use $dq-youtube-creator-gemini-notebook-knowledge-base for:
 https://www.youtube.com/@channel
 
 Collect public historical videos using collect-first, with item failures deferred.
@@ -198,7 +199,7 @@ Only public metadata is collected: no media or subtitle downloads, Gemini API ca
 
 ### 为什么使用单工作标签、串行处理？
 
-队列需要确认上一条是否真的提交、是否生成正文、聊天地址是否稳定以及标题是否改名成功。账号协调权只锁定短时页面动作；一个频道等待 Gemini 生成时，其他频道可以并行运行，但提交、读取和归档动作仍按账号统一排队。Gemini 页面动作和不同视频提交也有最小间隔，每处理20条还要休息至少2分钟。
+队列需要确认上一条是否真的提交、是否生成正文、聊天地址是否稳定以及标题是否改名成功。账号协调权只锁定短时页面动作；一个频道等待 Gemini 生成时，其他频道可以并行运行，但提交、读取和归档动作仍按账号统一排队。Gemini 页面动作和不同视频提交也有最小间隔，每处理20条还要休息至少90秒。
 
 ### 每日增量和历史任务谁优先？
 

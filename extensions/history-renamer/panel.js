@@ -4,19 +4,48 @@ import {runWithRecovery} from './recovery.js';
 
 const $ = id => document.getElementById(id);
 let pairing, running = false, stopping = false, workTab;
+let heartbeatTimer;
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const status = text => { $('status').textContent = text; };
 function checkStop() { if (stopping) throw new Error('interrupted'); }
 
 async function api(path, body = {}) {
   if (!pairing) throw new Error('请先选择配对文件');
-  const response = await fetch(pairing.bridge + path, {
-    method:'POST', headers:{'Content-Type':'application/json','X-YTG-Pairing':pairing.pairing},
-    body:JSON.stringify(body), signal:AbortSignal.timeout(15000), cache:'no-store'
-  });
-  const result = await response.json();
-  if (!response.ok || result.stopped) throw new Error(result.stopped || '本机服务拒绝操作');
+  let response;
+  try {
+    response = await fetch(pairing.bridge + path, {
+      method:'POST', headers:{'Content-Type':'application/json','X-YTG-Pairing':pairing.pairing},
+      body:JSON.stringify(body), signal:AbortSignal.timeout(15000), cache:'no-store'
+    });
+  } catch (error) {
+    throw new Error(`bridge_disconnected:${path}:${error?.name || 'network_error'}`);
+  }
+  let result;
+  try { result = await response.json(); }
+  catch { throw new Error(`bridge_invalid_response:${path}:HTTP_${response.status}`); }
+  if (!response.ok || result.stopped) throw new Error(`bridge_rejected:${path}:HTTP_${response.status}:${result.stopped || '本机服务拒绝操作'}`);
   return result;
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer=setInterval(async()=>{
+    if (!running || !pairing) return;
+    try { await api('/heartbeat'); }
+    catch { stopping=true; status('本机服务连接中断，已停止并保留未完成项目。'); }
+  },30000);
+}
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer=undefined; }
+}
+function native(action) {
+  return new Promise(resolve => chrome.runtime.sendMessage({type:`native-${action}`}, resolve));
+}
+async function bindPairing(value) {
+  pairing=value;
+  const job=await api('/next');
+  $('mapping').textContent=job.done ? '本机服务：已启动并已连接\n本批次已处理完成' : `本机服务：已启动并已连接\n账号：${job.account}\nGemini：${job.notebook}`;
+  status('本机服务已启动并已连接。首次使用请先检查一条。');
 }
 
 async function pace() {
@@ -115,20 +144,40 @@ $('pairing').onchange = async () => {
   try {
     const value=JSON.parse(await $('pairing').files[0].text());
     if (!/^http:\/\/127\.0\.0\.1:\d{4,5}$/.test(value.bridge) || !/^[\w-]{40,64}$/.test(value.pairing)) throw new Error('配对文件格式不正确');
-    pairing=value;
-    const job=await api('/next');
-    $('mapping').textContent=job.done ? '本批次已处理完成' : `账号：${job.account}\nGemini：${job.notebook}`;
-    status('配对完成。首次使用请先检查一条。');
-  } catch { pairing=null; status('无法配对，请确认本机服务正在运行并选择它生成的配对文件。'); }
+    await bindPairing(value);
+  } catch (error) {
+    pairing=null;
+    $('mapping').textContent='本机服务：未连接';
+    status(`未连接本机服务：${String(error?.message || error || '未知错误').slice(0,160)}。请重新启动服务并选择新配对文件。`);
+  }
+};
+
+$('nativeStart').onclick=async()=>{
+  try {
+    status('正在启动本机服务…');
+    const result=await native('start');
+    if (!result?.ok) throw new Error(result?.error || '本机组件未安装');
+    await bindPairing(result.pairing);
+  } catch (error) {
+    $('mapping').textContent='本机服务：未连接';
+    status(`启动失败：${String(error?.message || error || '未知错误').slice(0,160)}。首次使用请运行 install_native_host.cmd。`);
+  }
+};
+$('nativeStop').onclick=async()=>{
+  const result=await native('stop');
+  pairing=null;
+  $('mapping').textContent='本机服务：未连接';
+  status(result?.ok ? '本机服务已停止。' : `停止失败：${result?.error || '未知错误'}`);
 };
 
 const reasons = new Set(['ui_changed','account_mismatch','notebook_mismatch','video_mismatch','summary_unconfirmed','save_unverified','interrupted']);
-const messages = {ui_changed:'页面结构不匹配，需要适配',account_mismatch:'账号未匹配或尚未加载',notebook_mismatch:'笔记本或聊天归属未核实',video_mismatch:'原视频链接未匹配',summary_unconfirmed:'总结正文或生成状态未确认',save_unverified:'保存后的名称未核实',interrupted:'已停止，保留已登记进度'};
+const messages = {ui_changed:'页面结构不匹配，需要适配',account_mismatch:'账号未匹配或尚未加载',notebook_mismatch:'笔记本或聊天归属未核实',video_mismatch:'原视频链接未匹配',summary_unconfirmed:'总结正文或生成状态未确认',save_unverified:'保存后的名称未核实',interrupted:'已停止，保留已登记进度',bridge_disconnected:'本机改名服务连接中断',bridge_rejected:'本机服务拒绝领取或继续操作',bridge_invalid_response:'本机服务返回了无效响应'};
 
 async function run(preview,one) {
   if (running) return;
   if (!$('confirmed').checked) { status('请先核对账号、笔记本并勾选确认。'); return; }
   running=true; stopping=false;
+  startHeartbeat();
   ['preview','one','start','pairing'].forEach(id=>$(id).disabled=true);
   $('stop').disabled=false;
   let job,kind='chat',completed=0,phase='领取名单';
@@ -162,7 +211,10 @@ async function run(preview,one) {
       if (one) { status('一条改名及读回核对完成，可查看网页结果后开始批量。'); break; }
     }
   } catch (error) {
-    const reason = reasons.has(error.message) ? error.message : 'ui_changed';
+    const raw = String(error?.message || error || 'unknown_error');
+    const prefix = raw.split(':',1)[0];
+    const serviceReason = ['bridge_disconnected','bridge_rejected','bridge_invalid_response'].includes(prefix) ? prefix : null;
+    const reason = reasons.has(error?.message) ? error.message : (serviceReason || 'ui_changed');
     if (job && !job.done && !preview) {
       try {
         await api('/result',{video_id:job.video_id,title:job.title,kind,status:'pending',reason,
@@ -170,12 +222,13 @@ async function run(preview,one) {
           verification_phase:phase});
       } catch { /* Keep pending if the bridge disconnected. */ }
     }
-    const detail = String(error?.message || '').replace(/[^a-zA-Z0-9_.:-]/g,' ').slice(0,80) || reason;
-    status(`${messages[reason]}（步骤：${phase}；代码：${detail}）。未完成项目保留待处理。`);
+    const detail = raw.replace(/[\r\n]/g,' ').slice(0,160) || reason;
+    status(`${messages[reason] || '操作失败'}（步骤：${phase}；详情：${detail}）。未完成项目保留待处理。`);
     if (stopping && pairing) {
       try { await api('/release'); pairing=null; } catch { /* Queue lease expires if the local service is already gone. */ }
     }
   } finally {
+    stopHeartbeat();
     running=false;
     ['preview','one','start','pairing'].forEach(id=>$(id).disabled=false);
     $('stop').disabled=true;

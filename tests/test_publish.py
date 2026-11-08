@@ -6,7 +6,7 @@ import publish_check
 
 class PublishTests(unittest.TestCase):
     def test_local_skill_allowlist_is_exact_and_retains_content_checks(self):
-        base='.agents/skills/youtube-creator-gemini-notebook-knowledge-base/'
+        base='.agents/skills/dq-youtube-creator-gemini-notebook-knowledge-base/'
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             path=root/base/'SKILL.md'

@@ -305,7 +305,8 @@ def batch_step(s,job):
                              (state,reason,date,date,'publishedAt' if date else None,checked,job,vid))
                 if state=='complete':
                     s.db.execute('''UPDATE videos SET published=?,metadata_checked=?,
-                                    title=CASE WHEN state='pending' THEN ? ELSE title END
+                                    title=CASE WHEN state='pending' THEN ? ELSE title END,
+                                    title_source=CASE WHEN state='pending' THEN 'api' ELSE title_source END
                                     WHERE channel_id=? AND id=? AND (chat IS NULL OR published IS NULL)''',
                                  (date,checked,snippet.get('title') or '',cid,vid))
         return {'job':job,'state':'batch_complete','count':len(ids),'matched':len(items)}

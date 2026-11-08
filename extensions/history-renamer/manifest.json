@@ -3,12 +3,13 @@
   "name": "历史视频批量改名",
   "version": "0.2.0",
   "description": "通过网页菜单批量改名并核验历史 Gemini 聊天，不调用模型。",
-  "permissions": ["scripting"],
+  "permissions": ["scripting", "nativeMessaging"],
   "host_permissions": [
     "https://gemini.google.com/*",
     "http://127.0.0.1/*"
   ],
   "action": {"default_title": "打开历史改名工具"},
   "background": {"service_worker": "background.js"},
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqWo2f9O4uFHQybGWEmee9QGQZj05R9SJTZ+N0K+gUIS3fGyfmyDiRNCixFsZqD1Ovs4+GX29KjHO38JUb6KB05Sa5PHHKsuuHB1kN3OFQPr81BjOy0wF7f4mj6XlLLfYknC0JHzddTYsDXFJxKD8ifA04IlgbveES/22TLjFmCinoWmIiuScnCjwa9AH2k6RS6j5jHxkDtMoXqS305pptHGGOlxOpYP5Gu9Dslr8g6CS8VY+iMoaoCMeGAbe3HxdS4++gNTMwz3Ko/0Y8Fdc+lpVGBxSyRrd1JdnhKxrIiaA2qZkG/cYtgKHqSlcauvsO68W/LfDaSw5788VpmTdOwIDAQAB",
   "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
 }

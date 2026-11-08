@@ -1,0 +1,7 @@
+{
+  "name": "com.dq.history_rename",
+  "description": "历史视频批量改名本机服务",
+  "path": "native_host.exe",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://nakkjnjgfkdfhpgcgkafdlcjffcnkdbk/"]
+}
