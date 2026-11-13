@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -13,6 +14,20 @@ DEFAULT_METADATA_INTERVAL = 1.0
 MAX_BATCH_SIZE = 50
 MAX_API_RETRIES = 5
 MAX_BACKOFF_SECONDS = 60
+
+def _api_error_label(code, body=''):
+    """Return a bounded, key-free API error label for task diagnostics."""
+    reason = ''
+    try:
+        payload = json.loads(body or '{}')
+        error = payload.get('error') or {}
+        reasons = [str(item.get('reason', '')).strip() for item in error.get('errors', [])]
+        reason = next((item for item in reasons if item), '')
+        reason = reason or str(error.get('message', '')).strip()
+    except (TypeError, ValueError, AttributeError):
+        reason = ''
+    reason = re.sub(r'[^A-Za-z0-9_.:-]+', '_', reason)[:120]
+    return f'youtube_api_http_{int(code)}' + (f':{reason}' if reason else '')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata_jobs(id TEXT PRIMARY KEY,channel_id TEXT NOT NULL,
@@ -112,7 +127,8 @@ def fetch(s,url,flat=False,limit=None,extractor=None):
             if not str(exc).startswith('metadata_wait:'): raise
             time.sleep(min(30,int(str(exc).split(':')[1])))
     try:
-        key = os.environ.get('YOUTUBE_DATA_API_KEY')
+        from ytg import youtube_data_api_key
+        key, _ = youtube_data_api_key()
         if key and not flat and extractor is None:
             parsed = urllib.parse.urlparse(url)
             video = urllib.parse.parse_qs(parsed.query).get('v', [None])[0]
@@ -171,7 +187,13 @@ def start(s,cid):
         if s.pause_for(cid): raise Stop('Paused: '+s.pause_for(cid))
         if any(x['expires']>time.time() for x in s.conflicting_leases(cid)):
             raise Stop('Another worker owns the queue scope')
-        old=s.db.execute("SELECT id FROM metadata_jobs WHERE channel_id=? AND status<>'complete' ORDER BY created DESC LIMIT 1",(cid,)).fetchone()
+        latest=s.db.execute("SELECT id FROM metadata_jobs WHERE channel_id=? ORDER BY created DESC LIMIT 1",(cid,)).fetchone()
+        current_count=s.db.execute("SELECT count(*) FROM videos WHERE channel_id=? AND history=1",(cid,)).fetchone()[0]
+        old = latest if latest and s.db.execute(
+            "SELECT count(*) FROM metadata_items WHERE job=?",(latest['id'],)
+        ).fetchone()[0] == current_count else None
+        # A completed job is a snapshot. Rebuild it when a history
+        # reclassification or a later full inventory adds videos.
         if old:
             old_id=old['id']
         else:
@@ -195,7 +217,17 @@ def report(s,job):
     total=sum(counts.values())
     unresolved=counts.get('pending',0)+counts.get('fetching',0)+counts.get('review',0)
     waiting=s.db.execute("SELECT count(*) FROM metadata_items WHERE job=? AND state='pending' AND retry_after>?",(job,time.time())).fetchone()[0]
-    return dict(r,total=total,counts=counts,retry_wait=waiting,complete=unresolved==0,
+    complete=unresolved==0
+    channel=s.channel(r['channel_id'])
+    next_action=(
+        '日期补齐已结束。请向用户报告补齐数量、覆盖率和 unavailable/review 项；'
+        '日期标题格式下可开始历史视频总结。用户确认开始后，先创建本频道 Codex Goal，'
+        '再核对 Gemini Notebook、账号、频道状态和租约，然后启动 history run。'
+        if complete else '继续 metadata-backfill run，直到 complete=true。'
+    )
+    return dict(r,total=total,counts=counts,retry_wait=waiting,complete=complete,
+                channel_name=channel['name'],title_format=channel['title_format'],
+                next_action=next_action,
                 reused=s.db.execute("SELECT count(*) FROM metadata_items WHERE job=? AND reason='cache'",(job,)).fetchone()[0],
                 exceptions=[dict(x) for x in s.db.execute("SELECT video,state,reason FROM metadata_items WHERE job=? AND (state IN ('review','unavailable') OR reason IS NOT NULL AND reason<>'cache')",(job,))],
                 all_dates_complete=counts.get('complete',0)==total,
@@ -205,7 +237,8 @@ def report(s,job):
 def api_batch(s, ids):
     """Fetch up to 50 videos with one official YouTube Data API request."""
     from ytg import Stop, MetadataFailure
-    key = os.environ.get('YOUTUBE_DATA_API_KEY')
+    from ytg import youtube_data_api_key
+    key, _ = youtube_data_api_key()
     if not key or not ids:
         raise Stop('YOUTUBE_DATA_API_KEY is required for API batch mode')
     ids=list(dict.fromkeys(ids))
@@ -236,7 +269,7 @@ def api_batch(s, ids):
                 if int(error.get('code',500)) in {429,503}:
                     raise urllib.error.HTTPError(api_url, int(error.get('code',500)),
                                                  'YouTube API error', None, None)
-                raise MetadataFailure('youtube_api_http_'+str(error.get('code',500)))
+                raise MetadataFailure(_api_error_label(error.get('code',500), json.dumps(payload)))
             record_api_success(s)
             return {item.get('id'): item for item in payload.get('items', [])}
         except urllib.error.HTTPError as exc:
@@ -260,8 +293,8 @@ def api_batch(s, ids):
             if exc.code in {401,403}:
                 with s.tx():
                     s.db.execute('UPDATE metadata_access SET blocked=? WHERE id=1',
-                                 ('youtube_api_http_'+str(exc.code),))
-            raise
+                                 (_api_error_label(exc.code, body),))
+            raise MetadataFailure(_api_error_label(exc.code, body)) from exc
 
 def batch_step(s,job):
     """Process a maximum API page of 50 pending IDs in one transaction."""
@@ -319,17 +352,19 @@ def batch_step(s,job):
                     s.db.execute("UPDATE metadata_items SET state='pending',reason=? WHERE job=? AND video=?",
                                  (reason,job,vid))
             raise
+        diagnostic = category if category.startswith('youtube_api_http_') else 'metadata_error'
         with s.tx():
             for vid in ids:
                 attempts=s.db.execute('SELECT attempts FROM metadata_items WHERE job=? AND video=?',(job,vid)).fetchone()[0]+1
                 backoff=(60,300,900)[min(attempts-1,2)]
-                s.db.execute("UPDATE metadata_items SET state='pending',reason='metadata_error',attempts=?,retry_after=?,checked=? WHERE job=? AND video=?",(attempts,time.time()+backoff,time.time(),job,vid))
+                s.db.execute("UPDATE metadata_items SET state='pending',reason=?,attempts=?,retry_after=?,checked=? WHERE job=? AND video=?",(diagnostic,attempts,time.time()+backoff,time.time(),job,vid))
         raise
     finally:
         with s.tx(): s.db.execute('DELETE FROM lease WHERE run_id=?',(job,))
 
 def step(s,job,extractor=None):
-    if os.environ.get('YOUTUBE_DATA_API_KEY') and extractor is None:
+    from ytg import youtube_data_api_key
+    if youtube_data_api_key()[0] and extractor is None:
         return batch_step(s,job)
     from ytg import Stop,date_value,metadata_failure,MetadataFailure
     r=report(s,job); cid=r['channel_id']

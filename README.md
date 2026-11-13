@@ -23,7 +23,7 @@
 ### ✨ 值得装它的 5 个理由
 
 - **旧视频，按清单慢慢补齐。** 扫描公开视频和直播清单，按视频 ID 去重；Shorts 单独排除，历史处理不设总条数上限。
-- **总结完就整理好。** 每条生成后立即改名、核验，再处理下一条。标题统一为 `YYYYMMDD-主题词-完整原视频标题`，回头找内容更方便。
+- **总结完就整理好。** 默认方案及每日增量每条生成后立即改名、核验；历史选择方案2时，先完成扫描和 Gemini 总结，之后再用扩展批量改名和核验。标题统一为 `YYYYMMDD-主题词-完整原视频标题`，回头找内容更方便。
 - **中断了，留着进度接着做。** 记录任务状态和已有聊天，恢复时优先接续；提交不明时按规则保留现场，避免重复发送。
 - **哪条没做成，清清楚楚。** 授权失败后置后，首轮把单条异常列入待复查清单，继续后面的内容；生成数、核验数、延期项分开汇报。
 - **旧内容整理完，新内容也能跟。** 可另配每日增量任务，发现新视频；安装 Skill 本身不会自动开启定时任务。
@@ -62,7 +62,7 @@ python workbuddy_package.py --output C:\path\to\workbuddy-skill
 
 生成包包含 WorkBuddy 所需的双语元数据、`references/`、`scripts/` 和历史改名扩展；不会复制任务数据库、浏览器登录资料或摘要。WorkBuddy 统一使用指定外部 Chrome 执行浏览器负责 Gemini 生成、发送和核验；历史批量改名时也在该外部 Chrome 中运行本项目扩展。安装技能不等于 WorkBuddy 已具备可操作的 Gemini 浏览器，仍需通过适配指南中的页面能力检查。
 
-如果标题格式选择发布日期，项目会先建立视频清单，再检查日期覆盖率。日期未补齐前不会进入 Gemini 总结；需先完成 `metadata-backfill`，确认报告 `complete=true` 后再继续。
+如果标题格式选择发布日期，项目会先建立视频清单，再检查日期覆盖率。日期未补齐前不会进入 Gemini 总结；需先完成 `metadata-backfill`，确认报告 `complete=true` 后，报告覆盖率和异常数量，并提示用户可以开始历史总结。用户明确开始后，先创建或继续本频道 Codex Goal，再核对 Notebook、账号、频道状态和租约，然后继续历史处理。
 
 新频道还必须先有已核验的 Gemini Notebook。日期补齐后，如果 `preflight` 显示 Notebook 未登记，当前智能体会在获准的 Gemini 内置浏览器中创建并核验 Notebook，再登记其实际 URL；创建或核验失败时不会开始总结。
 
@@ -75,7 +75,7 @@ python workbuddy_package.py --output C:\path\to\workbuddy-skill
 https://www.youtube.com/@channel
 
 采集公开历史视频，允许单条失败后置，使用 collect-first。
-先核对现有进度、账号和对应笔记本，每条总结后立即改名核验。
+先核对现有进度、账号和对应笔记本。默认方案及每日增量每条总结后立即改名核验；历史若选择方案2，则先完成总结，之后再批量改名核验。
 结束时告诉我生成了多少、核验了多少，以及哪些还没完成。
 ```
 
@@ -84,7 +84,7 @@ https://www.youtube.com/@channel
 ### 📌 使用前，知道这几件事
 
 - **需要智能体持续执行。** 电脑关机、应用退出、登录失效或额度耗尽时，不能保证继续处理；暂停不代表后台还在跑。
-- **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文、确认停止且页面未跳转或中断后可在当前输入框重发一次，重试前不要求聊天地址，再等20秒。未完成则停止并延期，首次已有正文但未完成不重发。重试也占增量提交预算；不同视频和其他 Gemini 页面动作间隔至少15秒。
+- **限时检查。** collect-first 每次提交后20秒检查一次；首次无正文、确认停止且页面未跳转或中断后，允许的同聊天再次尝试须先切换“3.5 Flash-Lite极速回答 推理中”与“3.8 Flash全方位帮助”到另一模型，再点击已发送消息的“修改提示”，在“总结”前加“请”或去掉“请”后提交；不得在输入框原样重发。未完成则停止并延期，首次已有正文但未完成不重发。再次尝试也占增量提交预算；不同视频和其他 Gemini 页面动作间隔至少15秒。
 - **有节奏，也有边界。** 单工作标签串行处理，每20条结清后休息至少90秒；遇到登录、验证码或配额阻塞会停下，不能保证所有视频都能生成总结。
 - **页面操作节流。** Gemini 页面动作与不同视频提交至少间隔15秒。非提交动作由 `python ytg.py pace access --run RUN` 领取账号时间槽；协调权只覆盖当前页面动作窗口，其他频道可以并行等待 Gemini 生成；`arm` 和 `retry` 自动检查提交间隔。
 - **少留一份数据。** 只采集公开元数据，不下载视频、音频或字幕，不调用 Gemini API；摘要留在 Gemini，本地只记最小任务状态。
@@ -165,7 +165,7 @@ Report generated and verified counts, plus every unfinished item.
 
 The agent needs to remain available to execute the workflow. Login, quota, and session blockers can stop progress. Processing uses one working tab, with a break of at least 2 minutes after every 20 settled items.
 
-In collect-first, check once 20 seconds after each submission. A confirmed, stopped first attempt with no substantive body may be resent once in the current input without a chat URL, provided the page has not navigated or been interrupted, followed by one more 20-second wait. Stop and defer unfinished output; do not resend partial output. Retries count toward the incremental submission budget. Different videos and other Gemini UI actions have a minimum 15-second interval. See the worker procedure for recovery exceptions.
+In collect-first, check once 20 seconds after each submission. A confirmed, stopped first attempt with no substantive body may be tried once more in the same chat without a chat URL, provided the page has not navigated or been interrupted. Switch between “3.5 Flash-Lite极速回答 推理中” and “3.8 Flash全方位帮助” to the other model, then click “修改提示” on the sent message, change “总结” to “请总结” or vice versa, and submit the edited prompt; do not resend the same prompt from the input box. Stop and defer unfinished output; do not resend partial output. Retries count toward the incremental submission budget. Different videos and other Gemini UI actions have a minimum 15-second interval. See the worker procedure for recovery exceptions.
 
 Only public metadata is collected: no media or subtitle downloads, Gemini API calls, or local summary storage. **Isolated tests cover the queue rules**, but this does not establish long-term web reliability or summary accuracy. Check important claims against the original videos. See [validation records](docs/VALIDATION.md) and the [worker procedure](docs/WORKER.md).
 
@@ -176,6 +176,10 @@ Only public metadata is collected: no media or subtitle downloads, Gemini API ca
 ## 常见答疑
 
 ### 为什么第一次历史扫描用 yt-dlp，不全部用 YouTube Data API？
+
+### 为什么不能只看当前进程判断 API 是否存在？
+
+Windows 当前用户环境变量的更新不一定会进入已经启动的任务进程。项目因此按当前进程环境变量、Windows 当前用户环境变量的顺序读取 `YOUTUBE_DATA_API_KEY`，并在 `preflight` 中报告来源而不暴露密钥。读取到候选值后仍需通过官方接口实际验证；密钥过期、权限错误、配额耗尽和网络失败不是“缺少 API”，必须分别记录和处理。
 
 两者负责的事情不同：
 
@@ -203,7 +207,7 @@ Only public metadata is collected: no media or subtitle downloads, Gemini API ca
 
 ### 每日增量和历史任务谁优先？
 
-每日增量优先。当前历史视频结清后，如果频道的 `daily_due` 已到期，就切换到每日增量；每日轮次结束后再回到历史队列。只对 `tracking=1` 的频道判断每日到期。增量任务与历史任务共用账号级 Gemini 页面时间槽和多频道协调；扫描阶段使用独立的 YouTube 元数据节流，不占用 Gemini 时间槽。
+每日增量按 `tracking=1` 和本地每日时间窗独立调度，不要求历史首轮完成；同频道有历史租约时由定时增量接管，未知提交保留且不自动重发。只有完成过首条核验视频的频道才会开启 `tracking=1` 并参与每日到期判断。增量任务与历史任务共用账号级 Gemini 页面时间槽和多频道协调；扫描阶段使用独立的 YouTube 元数据节流，不占用 Gemini 时间槽。
 
 ### 遇到限流、配额或验证码怎么办？
 
@@ -226,12 +230,27 @@ python ytg.py gemini-limit-report
 
 ### 为什么失败后不自动无限重试？
 
-提交是否发生、聊天身份是否明确、正文是否完整，这些状态不能靠猜测恢复。collect-first 只允许符合证据条件的同聊天快速重试一次；其他未知提交、内容失败、无法核验或元数据缺失会延期，等待用户后续明确处理。
+提交是否发生、聊天身份是否明确、正文是否完整，这些状态不能靠猜测恢复。collect-first 只允许符合证据条件的同聊天快速再尝试一次：先切换到另一个指定模型，再点击已发送消息的“修改提示”，切换“请总结”与“总结”后提交；不能原样重发或另发新消息。其他未知提交、内容失败、无法核验或元数据缺失会延期，等待用户后续明确处理。
 
 ### 什么才算成功？
 
-必须完成总结、立即改名，并核对完整总结、原视频链接、准确标题、Google 账号和登记 Notebook。只有验证成功的条目才计入 verified；延期、未知提交和归档未核验都不算成功。
+必须完成总结，并按所选方案完成改名和核验：默认方案及每日增量立即改名；历史方案2在扩展归档阶段改名。核对完整总结、原视频链接、准确标题、Google 账号和登记 Notebook。只有验证成功的条目才计入 verified；延期、未知提交和归档未核验都不算成功。
 
 ### 安装技能后会自动在后台运行吗？
 
 不会。`ytg.py` 是队列工具，不是常驻后台服务。每日任务需要外部自动化或用户启动；本地数据库中的暂停或租约也不代表仍有进程在运行。
+# 数据库安全检查
+
+任务状态只保存在本机 canonical SQLite 数据库，不按频道拆分。运行队列前可检查数据库：
+
+```powershell
+python ytg.py db-check
+```
+
+需要备份时使用 SQLite 在线备份（路径必须是一个不存在的新文件）：
+
+```powershell
+python ytg.py db-check --backup C:\path\tasks-YYYYMMDD-HHMM.sqlite3
+```
+
+不要直接复制正在运行的 `.sqlite3`、`-wal` 或 `-shm` 文件，也不要用备份覆盖正在运行的主库。

@@ -47,17 +47,95 @@ class DailyWorkflowTests(unittest.TestCase):
         self.assertEqual(ytg.prepare(self.s, restored['run']), {'stop':'empty'})
         self.assertFalse(self.s.status(False, CID)['daily_due'])
 
-    def test_due_incremental_precedes_remaining_history_tasks(self):
-        vid=self.add(1,True)
+    def test_due_incremental_does_not_preempt_remaining_history_tasks(self):
+        self.add(1,True)
         history=self.s.begin('history',channel_id=CID,policy='collect-first')['id']
         self.assertEqual(ytg.prepare(self.s,history)['stop'], 'daily_due')
-        daily = self.s.handoff(history)['run']
-        self.assertEqual(self.s.db.execute('SELECT mode FROM runs WHERE id=?', (daily,)).fetchone()[0], 'incremental')
+        with patch.object(self.s, 'daily_due', return_value=True):
+            with self.assertRaisesRegex(ytg.Stop, 'history_pending'):
+                self.s.handoff(history)
 
     def test_untracked_channel_is_not_daily_due(self):
         self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
         self.assertFalse(self.s.daily_due(CID))
         self.assertFalse(self.s.status(False, CID)['daily_due'])
+
+    def test_scheduled_incremental_allows_unfinished_history(self):
+        self.add(1, history=True)
+        run = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')['id']
+        self.assertEqual(self.s.db.execute('SELECT mode FROM runs WHERE id=?', (run,)).fetchone()[0], 'incremental')
+
+    def test_daily_candidates_include_paused_and_leased_channels(self):
+        history = self.s.begin('history', channel_id=CID, policy='collect-first')
+        self.s.set_pause('unknown_submit', CID)
+        candidates = self.s.daily_candidates()
+        self.assertEqual([row['id'] for row in candidates], [CID])
+        self.assertEqual(self.s.db.execute('SELECT run_id FROM lease').fetchone()[0], history['id'])
+
+    def test_scheduled_incremental_reserves_only_ids_discovered_by_its_scan(self):
+        old = self.add(1)
+        new = 'new00000001'
+        run = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')['id']
+
+        def fetch(url, *args, **kwargs):
+            if url.endswith('/videos'):
+                return {'channel_id': CID, 'entries': [
+                    {'id': old, 'title': '旧积压', 'upload_date': '20261029'},
+                    {'id': new, 'title': '新视频', 'upload_date': '20261030'},
+                ]}
+            return {'channel_id': CID, 'entries': []}
+
+        ytg.scan(self.s, CID, fetch=fetch, run=run)
+        item = ytg.prepare(self.s, run)
+        self.assertEqual(item['id'], new)
+        self.s.cleanup(run)
+
+    def test_incremental_report_uses_current_scheduled_candidates(self):
+        old = self.add(1)
+        self.s.db.execute("UPDATE videos SET history=0 WHERE id=?", (old,))
+        run = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')['id']
+        new = 'new00000001'
+
+        def fetch(url, *args, **kwargs):
+            if url.endswith('/videos'):
+                return {'channel_id': CID, 'entries': [
+                    {'id': old, 'title': '旧积压', 'upload_date': '20261029'},
+                    {'id': new, 'title': '新视频', 'upload_date': '20261030'},
+                ]}
+            return {'channel_id': CID, 'entries': []}
+
+        ytg.scan(self.s, CID, fetch=fetch, run=run)
+        report = self.s.report('incremental', CID)
+        self.assertEqual(report['scope'], 'scheduled-day')
+        self.assertEqual(report['remaining'], 1)
+        self.assertEqual(report['counts']['pending'], 1)
+        self.assertEqual(report['legacy_backlog'], 2)
+        self.assertEqual(report['channels'][0]['channel_id'], CID)
+        self.assertEqual(report['channels'][0]['candidates'][0]['original_title'], '新视频')
+        self.s.cleanup(run)
+
+    def test_scheduled_collect_first_incremental_ignores_old_unknown_pause(self):
+        self.s.set_pause('unknown_submit', CID)
+        run = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')['id']
+        ytg.scan(self.s, CID, fetch=self.fetch, run=run)
+        self.assertEqual(self.s.pause_for(CID), 'unknown_submit')
+        self.s.cleanup(run)
+
+    def test_history_handoff_is_allowed_only_after_history_completion(self):
+        history = self.s.begin('history', channel_id=CID, policy='collect-first')['id']
+        with patch.object(self.s, 'daily_due', return_value=True):
+            daily = self.s.handoff(history)['run']
+        self.assertEqual(self.s.db.execute('SELECT mode FROM runs WHERE id=?', (daily,)).fetchone()[0], 'incremental')
+
+    def test_history_report_enables_tracking_only_after_completion(self):
+        self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
+        vid = self.add(1, history=True)
+        self.assertFalse(self.s.history_complete(CID))
+        self.assertFalse(self.s.report('history', CID)['complete'])
+        self.assertEqual(self.s.db.execute('SELECT tracking FROM channels WHERE id=?', (CID,)).fetchone()[0], 0)
+        self.s.db.execute("UPDATE videos SET state='verified', notebook_summary_checked=1 WHERE id=?", (vid,))
+        self.assertTrue(self.s.report('history', CID)['complete'])
+        self.assertEqual(self.s.db.execute('SELECT tracking FROM channels WHERE id=?', (CID,)).fetchone()[0], 1)
 
     def test_aggregate_daily_due_ignores_untracked_channels(self):
         self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
@@ -72,9 +150,8 @@ class DailyWorkflowTests(unittest.TestCase):
             self.s.end(daily)
         ytg.scan(self.s, CID, fetch=self.fetch, run=daily)
         self.add(2)
-        with self.assertRaises(ytg.Stop):
-            self.s.end(daily)
-        self.assertTrue(self.s.daily_due(CID))
+        self.s.end(daily)
+        self.assertFalse(self.s.daily_due(CID))
 
     def test_daily_budget_survives_new_manual_run_and_resets_next_day(self):
         for i in range(21):
@@ -101,8 +178,9 @@ class DailyWorkflowTests(unittest.TestCase):
         v = self.s.reserve(run)
         self.s.transition(run, CID, v['id'], 'arm')
         self.s.transition(run, CID, v['id'], 'uncertain')
-        self.s.transition(run, CID, v['id'], 'defer', 'submission_unconfirmed')
         self.assertFalse(self.s.pause_for(CID))
+        self.assertEqual(self.s.video(CID, v['id'])['state'], 'deferred')
+        self.assertEqual(self.s.video(CID, v['id'])['reason'], 'submission_unconfirmed')
         self.assertNotEqual(self.s.reserve(run)['id'], v['id'])
 
     def test_earlier_same_day_scan_does_not_skip_new_daily_round(self):

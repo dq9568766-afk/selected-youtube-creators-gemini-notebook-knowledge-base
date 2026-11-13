@@ -71,13 +71,28 @@ class CollectFirstTests(unittest.TestCase):
         run = self.begin()
         self.s.transition(run, CID, VID, 'arm')
         self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
-        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete-notebook')
         self.assertFalse(self.s.report(channel_id=CID)['complete'])
         self.s.transition(run, CID, VID, 'defer', 'archive_unverified')
         report = self.s.report(channel_id=CID)
         self.assertEqual((report['generated'], report['verified'], report['not_generated']), (1, 0, 0))
+        self.assertEqual(report['summary_completed'], 1)
+        self.assertEqual(report['summary_deferred'], [])
+        self.assertEqual(report['archive_unverified'], 1)
+        self.assertEqual(report['archive_manual_review_count'], 1)
         self.assertEqual(report['manual_review'][0]['chat'], CHAT)
         self.assertIn('expected_title', report['manual_review'][0])
+
+    def test_invalid_chat_requires_explicit_notebook_deletion_evidence(self):
+        run = self.begin()
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
+        self.s.transition(run, CID, VID, 'defer', 'content_failed')
+        self.assertEqual(self.s.report('history', CID)['cleanup_required'], 1)
+        with self.assertRaises(ytg.Stop):
+            self.s.transition(run, CID, VID, 'cleanup-invalid', evidence='chat-deleted')
+        self.s.transition(run, CID, VID, 'cleanup-invalid', evidence='chat-deleted-in-notebook')
+        self.assertEqual(self.s.report('history', CID)['cleanup_required'], 0)
 
     def test_cooldown_and_probe_stop_survive_cleanup_and_new_run(self):
         run = self.begin()
@@ -106,7 +121,7 @@ class CollectFirstTests(unittest.TestCase):
         self.s.db.execute('UPDATE runs SET health_probe=1,failure_streak=5 WHERE id=?', (run,))
         self.s.transition(run, CID, VID, 'arm')
         self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
-        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete-notebook')
         self.assertEqual(self.s.db.execute('SELECT failure_streak FROM runs WHERE id=?', (run,)).fetchone()[0], 0)
 
     def test_cleanup_keeps_pause_and_other_worker_state(self):
@@ -183,7 +198,7 @@ class CollectFirstTests(unittest.TestCase):
         self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
         with self.assertRaises(ytg.Stop):
             self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-same-chat')
-        item = self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        item = self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete-notebook')
         self.s.transition(run, CID, VID, 'renamed', item['expected_title'])
         self.s.transition(run, CID, VID, 'verify', item['expected_title'], 'current-page-video-summary')
         self.assertEqual(self.s.report(channel_id=CID)['verified'], 1)
@@ -212,9 +227,9 @@ class CollectFirstTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop):
             self.s.transition(run, CID, VID, 'retry', evidence='20s-no-body-stopped-current-page')
         with self.assertRaises(ytg.Stop):
-            self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+            self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete-notebook')
         self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
-        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete')
+        self.s.transition(run, CID, VID, 'summary', '主题', 'youtube-content-complete-notebook')
 
     def test_addressless_retry_interruption_and_missing_address(self):
         run = self.begin()

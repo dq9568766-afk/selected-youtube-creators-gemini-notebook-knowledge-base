@@ -62,6 +62,12 @@ class BackfillTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'50'):
                 backfill.api_batch(self.s, [f'{i:011d}' for i in range(51)])
 
+    def test_api_error_label_preserves_reason_without_sensitive_url(self):
+        body = '{"error":{"code":400,"message":"Invalid video ID","errors":[{"reason":"invalidVideoId"}]}}'
+        label = backfill._api_error_label(400, body)
+        self.assertEqual(label, 'youtube_api_http_400:invalidVideoId')
+        self.assertNotIn('test-key', label)
+
     def test_unavailable_is_not_all_dates_complete(self):
         job=self.job()
         with patch('backfill.gate'):
@@ -69,3 +75,11 @@ class BackfillTests(unittest.TestCase):
         r=backfill.report(self.s,job)
         self.assertTrue(r['complete'])
         self.assertFalse(r['all_dates_complete'])
+        self.assertIn('Codex Goal',r['next_action'])
+        self.assertEqual(r['channel_name'], '测试频道')
+
+    def test_incomplete_report_keeps_user_informed_to_continue_backfill(self):
+        job=self.job()
+        r=backfill.report(self.s,job)
+        self.assertFalse(r['complete'])
+        self.assertIn('继续 metadata-backfill run',r['next_action'])

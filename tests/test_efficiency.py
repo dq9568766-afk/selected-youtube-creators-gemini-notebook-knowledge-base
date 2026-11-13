@@ -225,7 +225,7 @@ class EfficiencyTests(unittest.TestCase):
         run=self.submitted()
         self.video(OTHER)
         self.s.db.execute('UPDATE videos SET title=?,metadata_checked=NULL WHERE id=?',(OTHER,OTHER))
-        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete-notebook')
         title=ytg.title_for(self.s.video(CID,VID))
         self.s.transition(run,CID,VID,'renamed',title)
         def fail(url,flat): raise RuntimeError('private extractor failure details')
@@ -240,7 +240,7 @@ class EfficiencyTests(unittest.TestCase):
     def test_summary_next_prepares_current_archive_without_metadata_fetch(self):
         run=self.submitted()
         self.video(OTHER)
-        result=ytg.advance(self.s,run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete',self.fetch)
+        result=ytg.advance(self.s,run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete-notebook',self.fetch)
         self.assertEqual(result['next']['state'],'summarized')
         self.assertEqual(result['next']['id'],VID)
         self.assertIn('expected_title',result['next'])
@@ -250,7 +250,7 @@ class EfficiencyTests(unittest.TestCase):
 
     def test_break_finalization_keeps_prepared_generation_and_orders_backlog(self):
         run = self.submitted()
-        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete-notebook')
         self.video(OTHER)
         next_item = ytg.prepare(self.s,run,self.fetch)
         self.assertEqual(next_item['id'],VID)
@@ -280,7 +280,7 @@ class EfficiencyTests(unittest.TestCase):
 
     def test_break_finalization_respects_scope_and_existing_backlog(self):
         run = self.submitted()
-        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete-notebook')
         self.s.db.execute('UPDATE videos SET owner=NULL')
         other_cid = 'UCYO_jab_esuFRV4b17AJtAw'
         self.s.db.execute('INSERT INTO channels(id,url,name,notebook,initialized) VALUES(?,?,?,?,1)',
@@ -293,7 +293,7 @@ class EfficiencyTests(unittest.TestCase):
 
     def test_break_finalization_orders_oldest_and_finishes_renamed_first(self):
         run = self.submitted()
-        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','主题','youtube-content-complete-notebook')
         self.video(OTHER)
         self.s.db.execute("UPDATE videos SET state='summarized',topic='主题',chat=?,found=0 WHERE id=?",(CHAT.replace('aaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbb'),OTHER))
         self.assertEqual(self.s.finalize(run)['id'],OTHER)
@@ -328,13 +328,14 @@ class EfficiencyTests(unittest.TestCase):
 
     def test_daily_handoff_waits_for_current_archive_then_runs_incremental(self):
         run=self.submitted()
-        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete-notebook')
         with patch('ytg.now',return_value=datetime(2026,10,27,5,0)):
             item=ytg.prepare(self.s,run,self.fetch)
             self.assertEqual(item['state'],'summarized')
             with self.assertRaises(ytg.Stop): self.s.park(run)
             self.s.transition(run,CID,VID,'renamed',item['expected_title'])
             self.s.transition(run,CID,VID,'verify',item['expected_title'],ytg.CURRENT_PAGE_EVIDENCE)
+            self.s.report('history', CID)
             self.assertEqual(ytg.prepare(self.s,run,self.fetch)['stop'],'daily_due')
             self.s.park(run)
             daily=self.s.begin('incremental',scheduled=True)['id']
@@ -385,6 +386,19 @@ class EfficiencyTests(unittest.TestCase):
         self.assertTrue(ytg.scan(self.s,CID,full=True,fetch=fetch)['complete'])
         self.assertEqual(calls,[None,None])
         self.assertEqual(self.s.video(CID,VID)['missing'],1)
+
+    def test_history_run_full_scan_classifies_existing_channel_inventory_as_history(self):
+        self.s.db.execute('UPDATE channels SET initialized=1')
+        run = self.s.begin('history', channel_id=CID)['id']
+        entry = {'id': 'hist0000001', 'title': '历史视频'}
+        self.s.insert(CID, entry, '2026-11-10T00:00:00', False)
+
+        def fetch(url, flat, limit=None):
+            return {'channel_id': CID, 'entries': [entry] if url.endswith('/videos') else []}
+
+        result = ytg.scan(self.s, CID, full=True, fetch=fetch, run=run)
+        self.assertTrue(result['complete'])
+        self.assertEqual(self.s.video(CID, entry['id'])['history'], 1)
 
     def test_scan_does_not_write_after_lease_expires_during_fetch(self):
         run = self.s.begin('incremental')['id']

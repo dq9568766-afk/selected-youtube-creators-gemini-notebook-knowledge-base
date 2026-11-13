@@ -164,6 +164,43 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn('setup is incomplete', payload['stopped'])
 
+    def test_cli_does_not_start_processing_without_notebook(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / 'tasks.sqlite3'
+            store = ytg.Store(db)
+            store.db.execute(
+                'INSERT INTO channels(id,url,name,initialized,rename_strategy,title_format,membership_status,config_confirmed) '
+                'VALUES(?,?,?,?,?,?,?,1)',
+                (CID, 'https://www.youtube.com/channel/' + CID, 'fixture', 1,
+                 'serial', 'original', 'no'),
+            )
+            store.db.close()
+            with mock.patch('sys.stdout') as stdout:
+                code = ytg.main(['--db', str(db), 'begin', '--mode', 'history', '--channel', CID])
+            payload = json.loads(''.join(call.args[0] for call in stdout.write.call_args_list))
+            self.assertEqual(code, 2)
+            self.assertIn('Notebook setup is incomplete', payload['stopped'])
+
+    def test_notebook_registration_enables_tracking_before_history_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / 'tasks.sqlite3'
+            store = ytg.Store(db)
+            store.db.execute(
+                'INSERT INTO channels(id,url,name,tracking) VALUES(?,?,?,0)',
+                (CID, 'https://www.youtube.com/channel/' + CID, 'fixture'),
+            )
+            store.db.close()
+            with mock.patch('sys.stdout') as stdout:
+                code = ytg.main(['--db', str(db), 'notebook', CID, BOOK])
+            self.assertEqual(code, 0)
+            result = ytg.Store(db)
+            row = result.db.execute(
+                'SELECT notebook,tracking FROM channels WHERE id=?', (CID,)
+            ).fetchone()
+            self.assertEqual(row['notebook'], BOOK)
+            self.assertEqual(row['tracking'], 1)
+            result.db.close()
+
 
 if __name__ == '__main__':
     unittest.main()

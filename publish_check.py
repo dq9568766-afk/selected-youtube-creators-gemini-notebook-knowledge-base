@@ -6,7 +6,7 @@ import sys
 
 ROOT=Path(__file__).resolve().parent
 TOP={'.gitignore','.githooks/pre-push','LICENSE','NOTICE.md','README.md','AGENTS.md','SKILL.md','agents/openai.yaml','pyproject.toml',
-     'ytg.py','backfill.py','history_rename.py','publish_check.py',
+     'ytg.py','backfill.py','history_rename.py','history_rename_native_host.py','publish_check.py',
      'workbuddy_package.py',
      '.agents/skills/dq-youtube-creator-gemini-notebook-knowledge-base/SKILL.md',
      '.agents/skills/dq-youtube-creator-gemini-notebook-knowledge-base/agents/openai.yaml'}

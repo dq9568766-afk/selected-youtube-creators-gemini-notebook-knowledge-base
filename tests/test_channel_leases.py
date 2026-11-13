@@ -98,6 +98,22 @@ class ChannelLeaseTests(unittest.TestCase):
             self.assertTrue(self.s.daily_due('b'))
             self.s.check_lease(b)
 
+    def test_scheduled_incremental_takes_over_same_channel_history_lease(self):
+        self.s.insert('a', {'id': 'rsv00000001', 'title': '待处理', 'upload_date': '20261030'}, 'scan', False)
+        self.s.insert('a', {'id': 'snd00000001', 'title': '发送中', 'upload_date': '20261030'}, 'scan', False)
+        history = self.s.begin('history', channel_id='a')['id']
+        self.s.db.execute("UPDATE videos SET state='reserved',owner=? WHERE channel_id='a' AND id='rsv00000001'", (history,))
+        self.s.db.execute("UPDATE videos SET state='submitting',owner=? WHERE channel_id='a' AND id='snd00000001'", (history,))
+        daily = self.s.begin('incremental', scheduled=True, channel_id='a', policy='collect-first')['id']
+        self.assertNotEqual(daily, history)
+        reserved = self.s.video('a', 'rsv00000001')
+        sending = self.s.video('a', 'snd00000001')
+        self.assertEqual((reserved['state'], reserved['owner']), ('pending', None))
+        self.assertEqual((sending['state'], sending['owner'], sending['reason']), ('uncertain', None, 'unknown_submit'))
+        self.assertEqual(self.s.db.execute('SELECT run_id FROM lease').fetchone()[0], daily)
+        with self.assertRaisesRegex(ytg.Stop, 'live lease'):
+            self.s.check_lease(history)
+
     def test_channel_resume_does_not_expire_other_channel(self):
         self.s.begin('history', channel_id='a')
         b = self.s.begin('history', channel_id='b')['id']

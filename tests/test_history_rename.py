@@ -42,7 +42,7 @@ class HistoryRenameTests(unittest.TestCase):
         item=ytg.prepare(self.s,self.run)
         self.s.transition(self.run,CID,item['id'],'arm')
         self.s.transition(self.run,CID,item['id'],'attach','https://gemini.google.com/app/'+f"{int(item['id'])+1:016x}",'video-match')
-        return self.s.transition(self.run,CID,item['id'],'summary','主题','youtube-content-complete')
+        return self.s.transition(self.run,CID,item['id'],'summary','主题','youtube-content-complete-notebook')
 
     def test_history_extension_batches_checked_summaries_counts_once_and_keeps_report_incomplete(self):
         hr.enable(self.s,self.run)
@@ -145,7 +145,8 @@ class HistoryRenameTests(unittest.TestCase):
         with self.assertRaises(ytg.Stop): bridge.next()
         self.s.clear_pause()
         self.s.db.execute('UPDATE lease SET expires=0 WHERE run_id=?',(self.run,))
-        with self.assertRaises(ytg.Stop): bridge.next()
+        # An expired lease is renewed by the bridge when no competing lease exists.
+        self.assertIn('video_id', bridge.next())
 
     def test_checkpoint_and_failure_survive_database_reopen(self):
         hr.enable(self.s,self.run); self.generate()
@@ -226,6 +227,8 @@ class HistoryRenameTests(unittest.TestCase):
                 ctx.exception.close()
             job=request('/next',info['pairing'])
             self.assertIn('video_id',job)
+            self.assertEqual(job['channel_id'],CID)
+            self.assertEqual(job['channel_name'],'fixture')
             self.assertNotIn('summary',job)
             self.assertNotIn('prompt',job)
             self.assertEqual(request('/heartbeat',info['pairing']),{'alive':True})

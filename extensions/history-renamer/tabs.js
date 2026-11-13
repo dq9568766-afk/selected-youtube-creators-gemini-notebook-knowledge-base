@@ -2,8 +2,18 @@ export async function openOrReuseTab(tabs, url, tabId) {
   if (tabId !== undefined && tabId !== null) {
     try {
       await tabs.get(tabId);
-      await tabs.update(tabId, {url, active:true});
-      return tabId;
+      let lastError;
+      for (let attempt=0; attempt<4; attempt++) {
+        try {
+          await tabs.update(tabId, {url, active:true});
+          return tabId;
+        } catch (error) {
+          lastError=error;
+          if (!/Tabs cannot be edited right now|dragging a tab/i.test(String(error?.message || error))) throw error;
+          await new Promise(resolve => setTimeout(resolve, 350*(attempt+1)));
+        }
+      }
+      throw lastError;
     } catch (error) {
       if (!/No tab with id/i.test(String(error?.message || error))) throw error;
     }

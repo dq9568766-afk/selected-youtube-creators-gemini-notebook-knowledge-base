@@ -18,6 +18,32 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+YOUTUBE_API_KEY_ENV = 'YOUTUBE_DATA_API_KEY'
+
+
+def youtube_data_api_key():
+    """Read the current local key on every call.
+
+    On Windows the user environment is authoritative.  A long-lived Python
+    process can retain an expired process value after the user updates the
+    environment, so checking HKCU first makes later requests pick up the new
+    value without restarting the worker.
+    """
+    if os.name == 'nt':
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment') as key:
+                value, _ = winreg.QueryValueEx(key, YOUTUBE_API_KEY_ENV)
+            value = str(value).strip()
+            if value:
+                return value, 'windows-user'
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            pass
+    value = os.environ.get(YOUTUBE_API_KEY_ENV, '').strip()
+    if value:
+        return value, 'process'
+    return None, None
+
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -27,6 +53,8 @@ CREATE TABLE IF NOT EXISTS initial_inventory(channel_id TEXT NOT NULL, tab TEXT 
  id TEXT NOT NULL, title TEXT NOT NULL, published TEXT, PRIMARY KEY(channel_id,tab,id));
 CREATE TABLE IF NOT EXISTS run_inventory(run_id TEXT NOT NULL, channel_id TEXT NOT NULL,
  checked TEXT NOT NULL, PRIMARY KEY(run_id,channel_id));
+CREATE TABLE IF NOT EXISTS run_candidates(run_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+ video_id TEXT NOT NULL, PRIMARY KEY(run_id,channel_id,video_id));
 CREATE TABLE IF NOT EXISTS pacing(scope TEXT PRIMARY KEY, processed INTEGER NOT NULL DEFAULT 0,
  break_started REAL);
 CREATE TABLE IF NOT EXISTS browser_pacing(scope TEXT PRIMARY KEY, last_access REAL NOT NULL DEFAULT 0,
@@ -81,6 +109,8 @@ CREATE TABLE IF NOT EXISTS videos(
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
  ('pending','reserved','submitting','submitted','summarized','renamed','verified','uncertain','blocked','deferred')),
  chat TEXT UNIQUE, topic TEXT, topic_source TEXT, topic_status TEXT NOT NULL DEFAULT 'pending',
+ notebook_summary_checked INTEGER NOT NULL DEFAULT 0,
+ chat_cleanup_status TEXT NOT NULL DEFAULT 'none', chat_cleanup_reason TEXT,
  final_title TEXT, reason TEXT, owner TEXT, metadata_checked REAL,
   title_source TEXT,
  PRIMARY KEY(channel_id,id));
@@ -99,6 +129,7 @@ ACCOUNT_COORDINATOR_HOLD = 15
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
 CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
+SUMMARY_NOTEBOOK_EVIDENCE = 'youtube-content-complete-notebook'
 API_TITLE_CHANNELS = {'UCBKDRq35-L8xev4O7ZqBeLg','UC8UCbiPrm2zN9nZHKdTevZA'}
 COLLECT_REASONS = {'generation_timeout','submission_unconfirmed','chat_unidentified','content_failed','archive_unverified','source_unavailable','metadata_unavailable','live_not_ready'}
 RENAME_STRATEGIES = {'serial', 'extension'}
@@ -123,6 +154,39 @@ def default_db_path():
     else:
         base = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
     return base / 'youtube-gemini-channel-summarizer' / 'tasks.sqlite3'
+
+DB_APPLICATION_ID = 0x59544751  # YTGQ; prevents accidentally opening another SQLite file.
+
+def database_backup(source, destination):
+    """Create a consistent backup while SQLite is online.
+
+    The SQLite backup API includes WAL state; copying *.sqlite3 directly does
+    not reliably do that while a worker is running.
+    """
+    source = Path(source)
+    destination = Path(destination)
+    if source.resolve() == destination.resolve():
+        raise Stop('Backup destination must differ from the task database')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise Stop('Backup destination already exists; choose a new path')
+    src = sqlite3.connect(source, timeout=30)
+    dst = None
+    try:
+        src.row_factory = sqlite3.Row
+        check = src.execute('PRAGMA integrity_check').fetchone()[0]
+        if check != 'ok':
+            raise Stop('Task database integrity check failed; backup not created')
+        dst = sqlite3.connect(destination)
+        src.backup(dst)
+        dst.commit()
+        if dst.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            raise Stop('Backup integrity check failed')
+    finally:
+        if dst is not None:
+            dst.close()
+        src.close()
+    return {'backup': str(destination), 'integrity': 'ok'}
 
 def channel_url(value):
     p = urlsplit(value)
@@ -248,8 +312,15 @@ def history_pipeline(s, cid, full=True):
                     'title_generation': {'generated': 0, 'review': date_report.get('total', 0)},
                     'complete': False}
     titles = generate_titles(s, cid)
-    return {'channel_id': cid, 'inventory': inventory, 'date_backfill': date_report,
-            'title_generation': titles, 'complete': titles['review'] == 0}
+    result = {'channel_id': cid, 'inventory': inventory, 'date_backfill': date_report,
+              'title_generation': titles, 'complete': titles['review'] == 0}
+    if date_report is not None and date_report.get('complete'):
+        result['history_summary_next_action'] = (
+            '日期补齐和标题候选已完成。请向用户报告日期覆盖率及 unavailable/review 项；'
+            '用户明确开始历史总结后，先创建或继续本频道 Codex Goal，'
+            '再核对 Gemini Notebook、账号、频道状态和租约，然后启动 history run。'
+        )
+    return result
 
 
 def metadata_fresh(row):
@@ -263,7 +334,7 @@ def metadata_fresh(row):
         return False
     # A channel listing can serve an auto-translated title instead of the
     # original video title. Only the official API confirms the original.
-    if row['channel_id'] in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+    if row['channel_id'] in API_TITLE_CHANNELS and youtube_data_api_key()[0]:
         return row['title_source']=='api' and bool(row['title'].strip()) and row['title'] != row['id']
     return bool(row['title'].strip()) and row['title'] != row['id']
 
@@ -300,7 +371,18 @@ class Store:
         self.path.parent.mkdir(parents=True,exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA busy_timeout=10000')
+        self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA journal_mode=WAL')
+        application_id = self.db.execute('PRAGMA application_id').fetchone()[0]
+        if application_id not in (0, DB_APPLICATION_ID):
+            raise Stop('This is not the canonical YouTube task database')
+        if application_id == 0:
+            self.db.execute(f'PRAGMA application_id={DB_APPLICATION_ID}')
+        if self.path.exists() and self.path.stat().st_size:
+            check = self.db.execute('PRAGMA integrity_check').fetchone()[0]
+            if check != 'ok':
+                raise Stop('Task database integrity check failed; refusing to write')
         had_pacing = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacing'").fetchone())
         self.db.executescript(SCHEMA)
         browser_columns={r['name'] for r in self.db.execute('PRAGMA table_info(browser_pacing)')}
@@ -323,8 +405,6 @@ class Store:
         if 'tracking' not in channel_columns:
             with self.tx():
                 self.db.execute('ALTER TABLE channels ADD COLUMN tracking INTEGER NOT NULL DEFAULT 0')
-                # A verified first summary opts the channel into daily tracking.
-                self.db.execute("UPDATE channels SET tracking=1 WHERE id IN (SELECT channel_id FROM videos WHERE state='verified')")
         channel_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(channels)')}
         with self.tx():
             for name, declaration in [
@@ -351,6 +431,9 @@ class Store:
                 ('topic_source', 'TEXT'),
                 ('topic_status', "TEXT NOT NULL DEFAULT 'pending'"),
                 ('final_title', 'TEXT'),
+                ('notebook_summary_checked', 'INTEGER NOT NULL DEFAULT 0'),
+                ('chat_cleanup_status', "TEXT NOT NULL DEFAULT 'none'"),
+                ('chat_cleanup_reason', 'TEXT'),
             ]:
                 if name not in columns:
                     self.db.execute(f'ALTER TABLE videos ADD COLUMN {name} {declaration}')
@@ -490,6 +573,15 @@ class Store:
             return row[0] if row else ''
         row=self.db.execute('SELECT reason FROM pauses ORDER BY updated DESC LIMIT 1').fetchone()
         return row[0] if row else ''
+
+    def pause_for_run(self,run):
+        """Allow scheduled collect-first incrementals past old unknown submits."""
+        row=self.db.execute('SELECT mode,policy,schedule_key,channel_id FROM runs WHERE id=?',(run,)).fetchone()
+        reason=self.pause_for(row['channel_id'] if row else None)
+        if (reason=='unknown_submit' and row and row['mode']=='incremental'
+                and row['policy']=='collect-first' and row['schedule_key']):
+            return ''
+        return reason
 
     def set_pause(self,reason,cid=None,observed_type=None,reset_at=None):
         scope='*' if reason in GLOBAL_PAUSES else (cid or '*')
@@ -751,6 +843,24 @@ class Store:
             raise Stop('Unknown video')
         return r
 
+    def requeue_manual_review(self, cid, reasons=None):
+        """Explicitly requeue deferred historical summaries for human review."""
+        self.channel(cid)
+        allowed = set(reasons or {'generation_timeout','content_failed','chat_unidentified'})
+        if not allowed or not allowed <= {'generation_timeout','content_failed','chat_unidentified'}:
+            raise Stop('Unsupported manual-review reason')
+        marks=','.join('?'*len(allowed))
+        with self.tx():
+            rows=self.db.execute(
+                f"SELECT id FROM videos WHERE channel_id=? AND history=1 AND state='deferred' AND reason IN ({marks})",
+                (cid,*sorted(allowed))).fetchall()
+            ids=[row['id'] for row in rows]
+            if ids:
+                self.db.execute(
+                    f"UPDATE videos SET state='pending',reason=NULL,owner=NULL,processed_counted=0,chat=NULL,reopen_required=0 WHERE channel_id=? AND id IN ({','.join('?'*len(ids))})",
+                    (cid,*ids))
+        return {'channel_id':cid,'requeued':len(ids),'reasons':sorted(allowed),'video_ids':ids}
+
     def insert(self,cid,entry,stamp,history):
         vid = entry.get('id')
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}',vid or ''):
@@ -773,7 +883,7 @@ class Store:
           reason=CASE WHEN videos.state='deferred' AND videos.reason='live_not_ready' AND videos.deferral_policy='strict' THEN NULL ELSE videos.reason END''',
           (cid,vid,title,published,int(history),time.time_ns(),stamp))
         if title.strip() and title != vid and (
-            not os.environ.get('YOUTUBE_DATA_API_KEY') or cid not in API_TITLE_CHANNELS
+            not youtube_data_api_key()[0] or cid not in API_TITLE_CHANNELS
         ):
             self.db.execute("UPDATE videos SET metadata_checked=? WHERE channel_id=? AND id=? AND state='pending' AND title=?", (time.time(),cid,vid,title))
 
@@ -789,7 +899,7 @@ class Store:
         if not r or r['run_id'] != run or r['expires'] < time.time():
             raise Stop('Run has no live lease; reopen the same run before continuing')
         run_row=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(run,)).fetchone()
-        reason=self.pause_for(run_row['channel_id'] if run_row else None)
+        reason=self.pause_for_run(run)
         if reason:
             raise Stop('Paused: '+reason)
         self.db.execute('UPDATE lease SET expires=?,last_seen=? WHERE run_id=?',(time.time()+900,time.time(),run))
@@ -798,7 +908,8 @@ class Store:
         return self.db.execute("SELECT * FROM lease WHERE (?='*' OR scope='*' OR scope=?)",
                                (channel_id or '*',channel_id or '*')).fetchall()
 
-    def begin(self,mode,scheduled=False,channel_id=None,policy='strict',run_id=None):
+    def begin(self,mode,scheduled=False,channel_id=None,policy='strict',run_id=None,
+              allow_history_handoff=False):
         with self.tx():
             if mode not in {'history','incremental'}:
                 raise Stop('Unknown run mode')
@@ -810,10 +921,13 @@ class Store:
                     raise Stop('Cannot reopen a finished, missing, or differently scoped run')
                 policy=saved['policy']
             reason=self.pause_for(channel_id)
+            if (reason=='unknown_submit' and mode=='incremental' and scheduled
+                    and policy=='collect-first' and channel_id):
+                reason=''
             if reason:
                 raise Stop('Paused: '+reason)
             if channel_id:
-                self.channel(channel_id)
+                channel = self.channel(channel_id)
                 date_status = self.date_backfill_status(channel_id)
                 if mode == 'history' and date_status['blocked']:
                     raise Stop('date_backfill_required: '+date_status['next_action'])
@@ -826,11 +940,17 @@ class Store:
                     raise Stop('Not yet the daily local 05:00 due window')
                 key = t.date().isoformat() + (':'+channel_id if channel_id else '')
             old_leases = self.conflicting_leases(channel_id)
-            if any(old['expires'] > time.time() for old in old_leases):
+            takeover = bool(mode == 'incremental' and scheduled and channel_id)
+            live_leases = [old for old in old_leases if old['expires'] > time.time()]
+            if any(old['scope']=='*' for old in live_leases):
+                raise Stop('Another worker owns the queue scope')
+            if live_leases and not takeover:
+                raise Stop('Another worker owns the queue scope')
+            if takeover and any(old['scope'] != channel_id for old in live_leases):
                 raise Stop('Another worker owns the queue scope')
             for old in old_leases:
                 self.db.execute("UPDATE videos SET state='pending',owner=NULL WHERE state='reserved' AND owner=?",(old['run_id'],))
-                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE state='submitting' AND owner=?",(old['run_id'],))
+                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit',owner=NULL WHERE state='submitting' AND owner=?",(old['run_id'],))
                 self.db.execute('DELETE FROM lease WHERE run_id=?',(old['run_id'],))
             scope=' AND channel_id=?' if channel_id else ''
             self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE state IN ('submitted','summarized','renamed')"+scope,(channel_id,) if channel_id else ())
@@ -892,7 +1012,7 @@ class Store:
         with self.tx():
             if owner:
                 run=self.db.execute('SELECT channel_id FROM runs WHERE id=?',(owner,)).fetchone()
-                reason=self.pause_for(run['channel_id'] if run else None)
+                reason=self.pause_for_run(owner) if run else self.pause_for(None)
                 if reason:
                     raise Stop('Paused: '+reason)
             self.db.execute("INSERT OR IGNORE INTO browser_pacing(scope) VALUES('gemini-account')")
@@ -975,6 +1095,10 @@ class Store:
     def _reserve_serial(self,run,archive_only=False):
         r=self.db.execute('SELECT * FROM runs WHERE id=?',(run,)).fetchone()
         history=int(r['mode']=='history')
+        channel = self.channel(r['channel_id']) if r['channel_id'] else None
+        if channel and not channel['notebook']:
+            return {'stop':'notebook_required',
+                    'next_action':'verify and register the channel Gemini Notebook before processing'}
         if history and r['channel_id']:
             date_status = self.date_backfill_status(r['channel_id'])
             if date_status['blocked']:
@@ -995,7 +1119,9 @@ class Store:
         self.db.execute("UPDATE runs SET phase='generate' WHERE id=?",(run,))
         if archive_only:
             return {'stop':'no_finalize'}
-        pending=self.db.execute("SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=? AND v.state IN ('pending','reserved') AND v.missing=0 AND c.initialized=1 AND c.notebook IS NOT NULL"+(' AND v.channel_id=?' if r['channel_id'] else '')+" ORDER BY (v.state='reserved') DESC,c.turn,COALESCE(v.published,'') DESC,v.found LIMIT 1",args).fetchone()
+        candidate_scope = " AND EXISTS (SELECT 1 FROM run_candidates rc WHERE rc.run_id=? AND rc.channel_id=v.channel_id AND rc.video_id=v.id)" if r['mode']=='incremental' and r['schedule_key'] else ''
+        pending_args = (history, r['channel_id'], run) if r['channel_id'] and candidate_scope else ((history, run) if candidate_scope else args)
+        pending=self.db.execute("SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=? AND v.state IN ('pending','reserved') AND v.missing=0 AND c.initialized=1 AND c.notebook IS NOT NULL"+(' AND v.channel_id=?' if r['channel_id'] else '')+candidate_scope+" ORDER BY (v.state='reserved') DESC,c.turn,COALESCE(v.published,'') DESC,v.found LIMIT 1",pending_args).fetchone()
         if not pending:
             if backlog and batch:
                 return {'stop':'archive_pending','next_action':'history-rename serve RUN; finish external extension batch'}
@@ -1038,6 +1164,9 @@ class Store:
             self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit' WHERE owner=? AND state='submitting'",(run,))
             self.db.execute("UPDATE videos SET reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE owner=? AND state IN ('submitted','summarized','renamed')",(run,))
             self.db.execute('DELETE FROM lease WHERE run_id=?',(run,))
+            # A crashed or forcibly terminated rename bridge cannot execute
+            # Bridge.close(); cleanup must invalidate its session explicitly.
+            self.db.execute('DELETE FROM history_rename_sessions WHERE run_id=?',(run,))
             self._coordinator_release(run)
             return {'cleaned':True}
 
@@ -1089,6 +1218,32 @@ class Store:
                             (day+':'+channel_id,day)).fetchone()
         return not bool(r)
 
+    def daily_candidates(self):
+        """Return the scheduled incremental candidates without filtering pauses or leases."""
+        return [dict(row) for row in self.db.execute(
+            """SELECT id, name, notebook
+               FROM channels
+               WHERE initialized=1 AND tracking=1
+               ORDER BY rowid""") if self.daily_due(row['id'])]
+
+    def history_complete(self, channel_id):
+        """Whether all historical items and archive work are settled."""
+        outstanding = self.db.execute(
+            """SELECT 1 FROM videos
+               WHERE channel_id=? AND history=1
+                 AND state NOT IN ('verified','deferred')
+               LIMIT 1""",
+            (channel_id,),
+        ).fetchone()
+        if outstanding:
+            return False
+        rename_pending = self.db.execute(
+            """SELECT 1 FROM history_rename_items
+               WHERE channel_id=? AND chat_status='pending' LIMIT 1""",
+            (channel_id,),
+        ).fetchone()
+        return not bool(rename_pending)
+
     def park(self,run):
         """Release a historical worker at a safe boundary for the daily round."""
         with self.tx():
@@ -1116,7 +1271,7 @@ class Store:
             if action in {'arm','retry'}:
                 if self.db.execute('SELECT 1 FROM history_rename_sessions WHERE run_id=? AND expires>?',(run,time.time())).fetchone():
                     raise Stop('Stop the external rename bridge before generating another video')
-                pause=self.pause_for(cid)
+                pause=self.pause_for_run(run)
                 if pause:
                     raise Stop('Submission blocked by '+pause+' pause')
             v = self.video(cid,vid)
@@ -1134,6 +1289,9 @@ class Store:
                 ) or (
                     action=='attach' and v['state']=='uncertain' and not v['chat'] and
                     evidence in {'video-match', 'marker-and-video-match'}
+                ) or (
+                    action=='cleanup-invalid' and v['state']=='deferred' and v['chat'] and
+                    v['chat_cleanup_status']!='verified'
                 )
                 if not reclaimable:
                     raise Stop('Item is not owned by this run')
@@ -1204,18 +1362,17 @@ class Store:
                     raise Stop('Inspect the original video URL in the chat first; also check the marker in older chats')
                 self.db.execute("UPDATE videos SET state='submitted',chat=?,reason=NULL WHERE channel_id=? AND id=?",(value,*args))
             elif action=='summary':
-                if v['state']!='submitted' or evidence!='youtube-content-complete':
-                    raise Stop('Require a completed, content-backed response in the linked chat')
+                if v['state']!='submitted' or evidence!=SUMMARY_NOTEBOOK_EVIDENCE:
+                    raise Stop('Require a completed response verified in the registered Gemini Notebook')
                 configured = v['title_format']
                 topic = None if configured == 'original' else (value or v['topic'])
                 title_for(v, topic)
-                self.db.execute("UPDATE videos SET state='summarized',topic=?,final_title=NULL,topic_status=CASE WHEN ? IS NULL THEN topic_status ELSE 'confirmed' END WHERE channel_id=? AND id=?",(topic, value, *args))
+                self.db.execute("UPDATE videos SET state='summarized',topic=?,final_title=NULL,notebook_summary_checked=1,topic_status=CASE WHEN ? IS NULL THEN topic_status ELSE 'confirmed' END WHERE channel_id=? AND id=?",(topic, value, *args))
                 self.db.execute("UPDATE runs SET phase='finalize' WHERE id=?",(run,))
                 if current_run['mode']=='history' and current_run['archive_mode']=='extension':
                     self.db.execute('INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)',args)
                     # Count the checked generation once, not again at batch rename.
                     self._count_processed(run,cid,vid)
-                    self.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(cid,))
                 self.set('source_failures',0)
                 self.set('source_failures:'+cid,0)
                 self.db.execute('UPDATE runs SET failure_streak=0,health_probe=0,health_after=0 WHERE id=?',(run,))
@@ -1226,11 +1383,18 @@ class Store:
             elif action=='verify':
                 if v['state']!='renamed' or value!=title_for(v) or evidence not in REOPEN_EVIDENCE | {CURRENT_PAGE_EVIDENCE}:
                     raise Stop('Require exact title, original video URL, complete summary, account and Notebook evidence')
+                if not v['notebook_summary_checked']:
+                    raise Stop('Summary was not verified in the registered Gemini Notebook')
                 if v['reopen_required'] and evidence not in REOPEN_EVIDENCE:
                     raise Stop('This chat requires reopened verification after '+v['reopen_required'])
                 self.db.execute("UPDATE videos SET state='verified',owner=NULL,reason=NULL,reopen_required=NULL WHERE channel_id=? AND id=?",args)
-                self.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(cid,))
                 self._count_processed(run,cid,vid)
+            elif action=='cleanup-invalid':
+                if v['state']!='deferred' or v['reason'] not in {'generation_timeout','content_failed','chat_unidentified','review:content_mismatch','review:summary_failed'}:
+                    raise Stop('Only a deferred failed chat can be cleaned')
+                if evidence!='chat-deleted-in-notebook':
+                    raise Stop('Delete the invalid chat in the registered Notebook and provide deletion evidence')
+                self.db.execute("UPDATE videos SET chat_cleanup_status='verified',chat_cleanup_reason=? WHERE channel_id=? AND id=?",(v['reason'],*args))
             elif action=='require-reopen':
                 if value not in REOPEN_REASONS or v['state'] not in {'submitting','submitted','summarized','renamed','uncertain'}:
                     raise Stop('Choose a supported reopen reason for an unfinished chat')
@@ -1238,12 +1402,29 @@ class Store:
             elif action=='uncertain':
                 if v['state'] not in {'submitting','submitted','summarized','renamed','uncertain'}:
                     raise Stop('No submission to reconcile')
-                self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit',reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE channel_id=? AND id=?",args)
+                # Scheduled collect-first incrementals may continue after a
+                # page-interrupted submission.  Preserve the item as an
+                # explicit deferral and never make it eligible for resend;
+                # the worker must open a fresh blank Notebook chat before the
+                # next arm.  Strict runs and historical runs retain the
+                # conservative unknown-submit pause.
+                if current_run['mode']=='incremental' and current_run['policy']=='collect-first':
+                    self.db.execute("UPDATE videos SET state='deferred',reason='submission_unconfirmed',deferral_policy='collect-first',owner=NULL,reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE channel_id=? AND id=?",args)
+                    self._count_processed(run,cid,vid)
+                else:
+                    self.db.execute("UPDATE videos SET state='uncertain',reason='unknown_submit',reopen_required=COALESCE(reopen_required,'page_interrupted') WHERE channel_id=? AND id=?",args)
                 if current_run['policy']=='strict':
                     self.set_pause('unknown_submit',cid)
             elif action=='defer':
                 collect=current_run['policy']=='collect-first'
-                allowed=COLLECT_REASONS if collect else {'source_unavailable','metadata_unavailable','live_not_ready','archive_unverified'}
+                # Strict runs may also defer confirmed generation failures and
+                # identity/content failures; WORKER requires these to remain
+                # explicit rather than being misclassified as source errors.
+                allowed=COLLECT_REASONS if collect else {
+                    'generation_timeout','submission_unconfirmed','chat_unidentified',
+                    'content_failed','source_unavailable','metadata_unavailable',
+                    'live_not_ready','archive_unverified'
+                }
                 if value not in allowed:
                     raise Stop('Unknown deferral reason')
                 if v['state'] not in {'reserved','submitting','submitted','uncertain','summarized','renamed'}:
@@ -1251,6 +1432,8 @@ class Store:
                 if v['state'] in {'summarized','renamed'} and value!='archive_unverified':
                     raise Stop('Preserve generated content as archive_unverified')
                 self.db.execute("UPDATE videos SET state='deferred',reason=?,deferral_policy=?,owner=NULL,metadata_checked=NULL WHERE channel_id=? AND id=?",(value,current_run['policy'],*args))
+                if v['chat'] and value in {'generation_timeout','content_failed','chat_unidentified'}:
+                    self.db.execute("UPDATE videos SET chat_cleanup_status='required',chat_cleanup_reason=? WHERE channel_id=? AND id=?",(value,*args))
                 self._count_processed(run,cid,vid)
                 if collect and value in {'generation_timeout','submission_unconfirmed','source_unavailable'}:
                     if current_run['health_probe']:
@@ -1289,7 +1472,10 @@ class Store:
                     checked=self.db.execute('SELECT checked FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid)).fetchone()
                     if not checked or checked[0][:10]!=now().date().isoformat():
                         raise Stop('Complete all scoped channel inventories before ending')
-                remaining=self.db.execute("SELECT count(*) FROM videos WHERE history=0 AND state NOT IN ('verified','deferred')"+(' AND channel_id=?' if r['channel_id'] else ''),(r['channel_id'],) if r['channel_id'] else ()).fetchone()[0]
+                if r['channel_id']:
+                    remaining=self.db.execute("SELECT count(*) FROM videos v JOIN run_candidates rc ON rc.channel_id=v.channel_id AND rc.video_id=v.id WHERE rc.run_id=? AND v.state NOT IN ('verified','deferred')",(run,)).fetchone()[0]
+                else:
+                    remaining=self.db.execute("SELECT count(*) FROM videos WHERE history=0 AND state NOT IN ('verified','deferred')").fetchone()[0]
                 if remaining and self.budget_used(r['channel_id'])<20 and r['armed']<20:
                     raise Stop('Incremental tasks remain; continue before ending')
                 self.db.execute('UPDATE runs SET outcome=? WHERE id=?',('budget_exhausted' if remaining else 'complete',run))
@@ -1309,10 +1495,13 @@ class Store:
             raise Stop('Handoff requires a channel-scoped run')
         cid=r['channel_id']
         if r['mode']=='history':
+            if not self.history_complete(cid):
+                raise Stop('history_pending: finish the channel history before incremental handoff')
             if not self.daily_due(cid):
                 raise Stop('Daily incremental is not due')
             self.park(run)
-            target=self.begin('incremental',scheduled=True,channel_id=cid,policy='collect-first')
+            target=self.begin('incremental',scheduled=True,channel_id=cid,policy='collect-first',
+                              allow_history_handoff=True)
             self.db.execute('UPDATE runs SET parent_run=? WHERE id=?',(run,target['id']))
             return {'run':target['id'],'mode':'incremental','channel_id':cid,'next_action':'scan --channel CHANNEL --run RUN; process until empty/daily_cap; handoff RUN'}
         if not r['parent_run']:
@@ -1345,16 +1534,60 @@ class Store:
     def report(self,mode='history',channel_id=None):
         if mode not in {'history','incremental'}:
             raise Stop('Unknown report mode')
-        query='SELECT v.*, c.title_format FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=?'
-        params=(int(mode=='history'),)
+        if mode == 'incremental':
+            # A daily report must describe the scheduled day's discovery set.
+            # The old global history=0 backlog can include baseline rows created
+            # by a recovered database and is not evidence of new uploads.
+            day = now().date().isoformat()
+            query='''SELECT DISTINCT v.*, c.title_format
+                     FROM videos v
+                     JOIN channels c ON c.id=v.channel_id
+                     WHERE v.history=0
+                       AND EXISTS (
+                           SELECT 1 FROM run_candidates rc
+                           JOIN runs r ON r.id=rc.run_id
+                           WHERE rc.channel_id=v.channel_id
+                             AND rc.video_id=v.id
+                             AND r.mode='incremental'
+                             AND r.schedule_key LIKE ?
+                       )'''
+            params=(day+'%',)
+        else:
+            query='SELECT v.*, c.title_format FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.history=1'
+            params=()
         if channel_id:
             self.channel(channel_id)
             query+=' AND v.channel_id=?'
             params+=(channel_id,)
         rows=list(self.db.execute(query+' ORDER BY found',params))
+        channel_reports={}
+        for row in rows:
+            key=row['channel_id']
+            if key not in channel_reports:
+                channel_reports[key]={
+                    'channel_id':key,
+                    'channel_name':self.db.execute('SELECT name FROM channels WHERE id=?',(key,)).fetchone()[0],
+                    'counts':{},
+                    'candidates':[],
+                }
+            bucket=channel_reports[key]
+            bucket['counts'][row['state']]=bucket['counts'].get(row['state'],0)+1
+            candidate={
+                'video_id':row['id'],
+                'original_title':row['title'],
+                'state':row['state'],
+            }
+            if row['final_title']:
+                candidate['final_title']=row['final_title']
+            if row['state']=='deferred':
+                candidate['reason']=row['reason']
+            if row['topic'] or row['title_format']=='original':
+                candidate['expected_title']=title_for(row)
+            bucket['candidates'].append(candidate)
         counts={}
         review=[]
         deferred={}
+        archive_unverified=0
         generated=0
         remaining=0
         total=0
@@ -1363,7 +1596,10 @@ class Store:
             total+=1
             generated+=int(row['state'] in {'summarized','renamed','verified'} or (row['state']=='deferred' and row['reason']=='archive_unverified' and bool(row['topic'])))
             if row['state']=='deferred':
-                deferred[row['reason']]=deferred.get(row['reason'],0)+1
+                if row['reason']=='archive_unverified':
+                    archive_unverified+=1
+                else:
+                    deferred[row['reason']]=deferred.get(row['reason'],0)+1
                 item={k:row[k] for k in ('channel_id','id','title','reason','chat','missing')}
                 item['url']='https://www.youtube.com/watch?v='+row['id']
                 if row['topic'] or row['title_format'] == 'original':
@@ -1373,12 +1609,47 @@ class Store:
                 remaining+=1
         rename_pending = self.db.execute("SELECT count(*) FROM history_rename_items WHERE chat_status='pending'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ()).fetchone()[0] if mode=='history' else 0
         rename_review = [dict(x) for x in self.db.execute("SELECT channel_id,video_id,chat_status,reason FROM history_rename_items WHERE chat_status='review'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ())] if mode=='history' else []
+        rename_pending_ids = {row[0] for row in self.db.execute("SELECT video_id FROM history_rename_items WHERE chat_status='pending'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ())} if mode=='history' else set()
+        notebook_unverified = sum(1 for row in rows if row['state'] in {'summarized','renamed','verified'} and not row['notebook_summary_checked'])
+        notebook_verified = sum(1 for row in rows if row['state'] in {'summarized','renamed','verified'} and row['notebook_summary_checked'])
+        cleanup_required = sum(1 for row in rows if row['state']=='deferred' and row['chat'] and row['chat_cleanup_status']!='verified')
+        archive_review_ids={row['id'] for row in rows if row['state']=='deferred' and row['reason']=='archive_unverified'}
+        archive_review_ids.update(item['video_id'] for item in rename_review)
+        manual_review_count = sum(1 for row in rows if row['state']=='deferred' and row['reason']!='archive_unverified') + len(archive_review_ids)
+        completed_count = sum(1 for row in rows if row['state']=='verified')
         date_status = self.date_backfill_status(channel_id) if channel_id else None
-        return {'mode':mode,'channel_id':channel_id,'complete':remaining==0 and rename_pending==0,'remaining':remaining,'rename_pending':rename_pending,
-                'rename_manual_review':rename_review,'counts':counts,'deferred':[{'reason':k,'count':v} for k,v in sorted(deferred.items())],
-                'manual_review':review,'generated':generated,'verified':counts.get('verified',0),
+        complete = remaining==0 and rename_pending==0 and notebook_unverified==0
+        if mode=='history' and channel_id and complete:
+            with self.tx():
+                self.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(channel_id,))
+        summary_deferred=[{'reason':k,'count':v} for k,v in sorted(deferred.items())]
+        result={'mode':mode,'channel_id':channel_id,'complete':complete,'remaining':remaining,'rename_pending':rename_pending,
+                'rename_manual_review':rename_review,'counts':counts,'deferred':summary_deferred,
+                'summary_deferred':summary_deferred,'archive_unverified':archive_unverified,
+                'archive_manual_review_count':len(archive_review_ids),
+                'summary_done_pending_rename':len(rename_pending_ids),
+                'manual_review_count':manual_review_count,
+                'completed_count':completed_count,
+                 'notebook_verified':notebook_verified,
+                 'notebook_unverified':notebook_unverified,
+                 'cleanup_required':cleanup_required,
+                'manual_review':review,'generated':generated,'summary_completed':generated,
+                'verified':counts.get('verified',0),
                 'not_generated':total-generated,'success_rate':generated/total if total else 0,
-                'date_backfill':date_status}
+                'date_backfill':date_status,
+                'channels':list(channel_reports.values())}
+        if mode == 'incremental':
+            legacy_query='''SELECT COUNT(*) FROM videos v
+                            WHERE v.history=0
+                              AND v.state NOT IN ('verified','deferred')'''
+            legacy_params=()
+            if channel_id:
+                legacy_query+=' AND v.channel_id=?'
+                legacy_params=(channel_id,)
+            result['scope']='scheduled-day'
+            result['schedule_key_prefix']=day
+            result['legacy_backlog']=self.db.execute(legacy_query,legacy_params).fetchone()[0]
+        return result
 
 class MetadataFailure(Stop):
     """Only a safe category is exposed; raw extractor diagnostics stay in memory."""
@@ -1442,6 +1713,7 @@ def preflight(s, cid):
     config = s.channel_config(cid)
     date_status = s.date_backfill_status(cid)
     notebook_registered = bool(channel['notebook'])
+    _, api_key_source = youtube_data_api_key()
     try:
         import yt_dlp  # noqa: F401
         yt_dlp_ready = True
@@ -1481,6 +1753,16 @@ def preflight(s, cid):
                 'required': date_status['required'],
                 'satisfied': not date_status['blocked'],
             },
+            'youtube_data_api': {
+                'required': date_status['required'],
+                'configured': api_key_source is not None,
+                'source': api_key_source,
+                'key': 'present' if api_key_source else 'missing',
+                'next_action': (
+                    None if api_key_source else
+                    '在 Windows 当前用户环境变量中设置 YOUTUBE_DATA_API_KEY；不要发送到聊天或写入项目文件'
+                ),
+            },
         },
         'notebook_setup': {
             'required': True,
@@ -1499,18 +1781,24 @@ def require_channel_config(s, cid):
     if not config['complete']:
         raise Stop('Channel setup is incomplete; confirm rename strategy, title format, and membership first')
 
+
+def require_processing_setup(s, cid):
+    """Require the local choices and the verified Notebook mapping before queue work."""
+    require_channel_config(s, cid)
+    if not s.channel(cid)['notebook']:
+        raise Stop('Notebook setup is incomplete; verify and register the channel Gemini Notebook first')
+
 def scan(s,cid,full=False,fetch=extract,run=None):
     import backfill
     original_fetch=fetch
     if original_fetch is extract:
         fetch=lambda url,flat=False,limit=None: backfill.fetch(s,url,flat,limit,original_fetch)
     c = s.channel(cid)
-    if s.pause_for(cid):
-        raise Stop('Paused: '+s.pause_for(cid))
+    round_info = None
     if run:
         with s.tx():
             s.check_lease(run)
-            round_info = s.db.execute('SELECT schedule_key,scan_stamp,channel_id FROM runs WHERE id=?',(run,)).fetchone()
+            round_info = s.db.execute('SELECT schedule_key,scan_stamp,channel_id,mode FROM runs WHERE id=?',(run,)).fetchone()
             if round_info['channel_id'] and round_info['channel_id']!=cid:
                 raise Stop('Scan channel is outside run scope')
             day = (round_info['schedule_key'] or '')[:10]
@@ -1520,6 +1808,10 @@ def scan(s,cid,full=False,fetch=extract,run=None):
                 return {'channel_id':cid,'complete':True,'skipped':'already_checked_today','tabs':[],
                         'date_coverage':'full' if full else 'recent-window','excluded_tabs':['shorts']}
             s.db.execute('DELETE FROM run_inventory WHERE run_id=? AND channel_id=?',(run,cid))
+    pause = s.pause_for_run(run) if run else s.pause_for(cid)
+    if pause:
+        raise Stop('Paused: '+pause)
+    history_inventory = bool(run and round_info['mode'] == 'history' and full)
     stamp = now().isoformat()
     complete = True
     results = []
@@ -1569,7 +1861,17 @@ def scan(s,cid,full=False,fetch=extract,run=None):
                         excluded_members += 1
                         continue
                     if c['initialized']:
-                        s.insert(cid,entry,stamp,False)
+                        was_present = bool(s.db.execute(
+                            'SELECT 1 FROM videos WHERE channel_id=? AND id=?',
+                            (cid, entry.get('id'))).fetchone())
+                        s.insert(cid,entry,stamp,history_inventory)
+                        if (run and round_info['mode']=='incremental' and round_info['schedule_key']
+                                and not was_present):
+                            s.db.execute(
+                                'INSERT OR IGNORE INTO run_candidates(run_id,channel_id,video_id) VALUES(?,?,?)',
+                                (run, cid, entry['id']))
+                        if history_inventory:
+                            s.db.execute('UPDATE videos SET history=1 WHERE channel_id=? AND id=?',(cid,entry['id']))
                     else:
                         if not re.fullmatch(r'[A-Za-z0-9_-]{11}',entry.get('id') or ''):
                             raise Stop('Invalid video id in inventory')
@@ -1675,7 +1977,7 @@ def metadata(s,run,cid,vid,fetch=extract,force=False):
             raise Stop('Metadata update only allowed for the current reserved item')
         if not force and metadata_fresh(v):
             return s.payload(v)
-    if cid in API_TITLE_CHANNELS and os.environ.get('YOUTUBE_DATA_API_KEY'):
+    if cid in API_TITLE_CHANNELS and youtube_data_api_key()[0]:
         return api_metadata(s,run,cid,vid)
     try:
         import backfill
@@ -1792,6 +2094,9 @@ def main(argv=None):
     p.add_argument('--verbose',action='store_true',help='Return full records for troubleshooting')
     sub = p.add_subparsers(dest='cmd',required=True)
     a = sub.add_parser('status'); a.add_argument('--channel')
+    sub.add_parser('daily-candidates', help='List due tracking channels without filtering pauses or leases')
+    a = sub.add_parser('db-check', help='Check the canonical database without changing task state')
+    a.add_argument('--backup', help='Also create a consistent SQLite online backup at this path')
     a = sub.add_parser('preflight'); a.add_argument('--channel', required=True)
     a = sub.add_parser('channel-config'); a.add_argument('channel')
     a.add_argument('--rename-strategy', choices=sorted(RENAME_STRATEGIES))
@@ -1805,13 +2110,14 @@ def main(argv=None):
     a = sub.add_parser('history-pipeline'); a.add_argument('--channel', required=True); a.add_argument('--full',action='store_true')
     a = sub.add_parser('begin'); a.add_argument('--mode',choices=['history','incremental'],required=True); a.add_argument('--scheduled',action='store_true'); a.add_argument('--channel'); a.add_argument('--policy',choices=['strict','collect-first'],default='strict'); a.add_argument('--run')
     a.add_argument('--archive',choices=['serial','extension'],default=None,help='History only: batch rename in the external extension')
-    a = sub.add_parser('history-rename'); a.add_argument('operation',choices=['configure','enable','serve','report','review']); a.add_argument('run',nargs='?'); a.add_argument('--auto',action='store_true',help='Serve the only active extension history run'); a.add_argument('--channel'); a.add_argument('--account'); a.add_argument('--port',type=int,default=8765); a.add_argument('--include-verified',action='store_true'); a.add_argument('--video'); a.add_argument('--reason')
+    a = sub.add_parser('history-rename'); a.add_argument('operation',choices=['configure','enable','candidates','resume','serve','report','review']); a.add_argument('run',nargs='?'); a.add_argument('--auto',action='store_true',help='Deprecated: requires explicit selection'); a.add_argument('--channel'); a.add_argument('--account'); a.add_argument('--port',type=int,default=8765); a.add_argument('--include-verified',action='store_true'); a.add_argument('--video'); a.add_argument('--reason')
     a = sub.add_parser('next'); a.add_argument('run'); a.add_argument('--parallel',action='store_true')
     for name in ('prepare','park','end','renew','finalize','cleanup','handoff'):
         a = sub.add_parser(name); a.add_argument('run')
     a = sub.add_parser('metadata'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('--force',action='store_true')
     a = sub.add_parser('title-refresh'); a.add_argument('channel'); a.add_argument('--limit',type=int); a.add_argument('--states',help='Comma separated states to correct, default pending,deferred')
-    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','retitle','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
+    a = sub.add_parser('requeue-manual-review'); a.add_argument('channel'); a.add_argument('--reasons',default='generation_timeout,content_failed,chat_unidentified')
+    a = sub.add_parser('step'); a.add_argument('run'); a.add_argument('channel'); a.add_argument('video'); a.add_argument('action',choices=['arm','retry','attach','summary','renamed','verify','cleanup-invalid','retitle','require-reopen','uncertain','defer','skip']); a.add_argument('--value'); a.add_argument('--evidence'); a.add_argument('--next',dest='advance',action='store_true')
     a = sub.add_parser('report'); a.add_argument('--mode',choices=['history','incremental'],default='history'); a.add_argument('--channel')
     a = sub.add_parser('gemini-limit-report'); a.add_argument('--channel')
     a = sub.add_parser('pause'); a.add_argument('reason',choices=sorted(REASONS)); a.add_argument('--channel')
@@ -1824,8 +2130,15 @@ def main(argv=None):
     try:
         if not Path(args.db).is_file() and args.cmd!='add':
             raise Stop('Task database is missing; refusing to create an empty replacement')
-        s = Store(args.db)
+        if args.cmd=='db-check':
+            s = Store(args.db)
+            result={'database': str(Path(args.db)), 'integrity':'ok', 'application_id':DB_APPLICATION_ID}
+            if args.backup:
+                result.update(database_backup(args.db,args.backup))
+        else:
+            s = Store(args.db)
         if args.cmd=='status': result=s.status(verbose=args.verbose,channel_id=args.channel)
+        elif args.cmd=='daily-candidates': result=s.daily_candidates()
         elif args.cmd=='preflight': result=preflight(s,args.channel)
         elif args.cmd=='channel-config':
             if not any((args.rename_strategy, args.title_format, args.membership)):
@@ -1871,7 +2184,11 @@ def main(argv=None):
                             raise Stop('--replace-verified requires --evidence account-notebook-checked')
                     elif not args.replace_missing:
                         raise Stop('Existing notebook mapping cannot be overwritten; verify the target account and Notebook in Gemini, then use --replace-verified --evidence account-notebook-checked')
-                s.db.execute('UPDATE channels SET notebook=? WHERE id=?',(args.url,args.channel))
+                # Registering a verified Notebook is the explicit opt-in for a
+                # new channel.  Tracking is enabled here, before the history
+                # scan, so scheduled incremental can run independently while
+                # the historical queue is still unfinished.
+                s.db.execute('UPDATE channels SET notebook=?, tracking=1 WHERE id=?',(args.url,args.channel))
             result=dict(s.channel(args.channel))
         elif args.cmd=='scan':
             ids = [args.channel] if args.channel else [x[0] for x in s.db.execute('SELECT id FROM channels')]
@@ -1882,7 +2199,7 @@ def main(argv=None):
             result=history_pipeline(s,args.channel,full=True)
         elif args.cmd=='begin':
             if args.channel:
-                require_channel_config(s, args.channel)
+                require_processing_setup(s, args.channel)
             if args.archive=='extension' and (args.mode!='history' or not args.channel):
                 raise Stop('Extension archive requires channel-scoped history')
             if args.archive and args.run:
@@ -1914,6 +2231,8 @@ def main(argv=None):
             result={'renewed':True}
         elif args.cmd=='metadata': result=metadata(s,args.run,args.channel,args.video,force=args.force)
         elif args.cmd=='title-refresh': result=title_refresh(s,args.channel,args.limit,args.states)
+        elif args.cmd=='requeue-manual-review':
+            result=s.requeue_manual_review(args.channel,[x.strip() for x in args.reasons.split(',') if x.strip()])
         elif args.cmd=='step':
             if args.advance:
                 result=advance(s,args.run,args.channel,args.video,args.action,args.value,args.evidence)

@@ -1,15 +1,13 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><title>历史视频批量改名</title>
 <link rel="stylesheet" href="panel.css">
-<main><h1>历史视频批量改名</h1>
-<p>只处理本机服务提供的历史名单。请确认当前浏览器登录的是登记账号，并暂停本频道其他 Gemini 操作。</p>
-<label>选择本机服务生成的配对文件 <input id="pairing" type="file" accept=".json"></label>
-<div class="actions"><button id="nativeStart">启动本机服务</button><button id="nativeStop">停止本机服务</button></div>
-<p id="mapping">本机服务：未连接</p>
-<label><input id="confirmed" type="checkbox">我已核对当前浏览器账号及Gemini 笔记本，并暂停本频道其他操作</label>
-<div class="actions"><button id="preview">只检查一条</button><button id="one">改名一条</button><button id="start">开始批量改名</button><button id="stop" disabled>停止</button></div>
-<p>首次使用先检查一条，再改名一条。批量执行时保持此工具页打开；页面变化、暂时加载失败或保存后读回异常时，工具会从登记笔记本自动重开并重做核验，最多两次；仍无法确认才停止并保留待处理。</p>
-<output id="status" role="status">等待配对文件</output>
-<p id="counts"></p>
-<details><summary>运行说明</summary><p>总结仍在 Gemini 页面生成。工具只使用页面菜单，不发送提示词、不调用 Google 私有接口、不保存总结正文。NotebookLM 中的 Gemini 对话来源不能独立改名，是否同步需另行核对。</p><p>首次使用请运行扩展目录中的 install_native_host.cmd，完成一次本机组件安装。以后点击“启动本机服务”即可，不再需要 CMD 或选择配对文件；选择文件仍保留为备用方式。</p></details>
+<main>
+<header class="hero"><div><p class="eyebrow">Gemini 历史整理工具</p><h1>历史视频批量改名</h1><p class="subtitle">先选择频道，再决定是重建映射还是执行改名。</p></div><span class="version">0.2.1</span></header>
+<section class="card"><div class="section-title"><span class="step">1</span><div><h2>选择历史任务</h2><p>只处理你明确选择的频道，不会自动接管其他任务。</p></div></div><div class="task-row"><button id="refreshCandidates" class="secondary">读取可用任务</button><select id="runSelect" aria-label="选择历史改名任务"><option value="">请先读取可用任务</option></select></div><div id="mapping" class="connection disconnected">本机服务：未连接</div></section>
+<section class="card"><div class="section-title"><span class="step">2</span><div><h2>准备本机服务</h2><p>点击一次即可为当前频道启动或恢复服务。</p></div></div><button id="nativeStart" class="wide-button">启动 / 恢复服务</button><div class="advanced-actions"><button id="nativeStop" class="secondary" disabled>停止服务</button><button id="cleanupRun" class="text-button" disabled>清理残留</button></div></section>
+<section class="card"><div class="section-title"><span class="step">3</span><div><h2>重建视频映射</h2><p>名单为空或数据库回退时使用。不会发送 Gemini 消息，也不会改名。</p></div></div><button id="rebuild" class="wide-button">重建映射</button><p class="hint">工具只在登记 Notebook 内读取近期对话和原视频链接。已写回的映射不会重复处理；每 20 条冷却 40 秒，不设总条数上限。</p></section>
+<section class="card"><div class="section-title"><span class="step">4</span><div><h2>批量改名</h2><p>确认账号和 Notebook 后，直接开始批量改名。</p></div></div><label class="confirm"><input id="confirmed" type="checkbox">我已核对当前浏览器账号和 Gemini 笔记本，并暂停本频道其他操作</label><button id="start" class="wide-button">开始批量改名</button><div class="advanced-actions"><button id="preview" class="secondary">只检查一条</button><button id="one" class="secondary">改名一条</button><button id="stop" class="danger" disabled>停止</button></div><p class="hint">页面变化、加载失败或保存后核验异常时，会自动重开并重做核验；无法确认的项目会保留待处理。</p></section>
+<section class="status-card"><div class="status-label">当前状态</div><output id="status" role="status">等待选择历史任务</output><p id="counts" class="counts"></p></section>
+<details><summary>运行说明</summary><div class="details-body"><p>总结仍在 Gemini 页面生成。工具只使用页面菜单，不发送提示词、不调用 Google 私有接口、不保存总结正文。NotebookLM 中的 Gemini 对话来源不能独立改名，是否同步需另行核对。</p><p>首次使用请运行扩展目录中的 install_native_host.cmd，完成一次本机组件安装。以后点击“启动 / 恢复服务”即可。</p></div></details>
 </main><script type="module" src="panel.js"></script></html>
+

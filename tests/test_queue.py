@@ -100,10 +100,12 @@ class QueueTests(unittest.TestCase):
 
     def test_completed_flow_and_verification_gate(self):
         run=self.claimed()
-        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete')
+        with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete-notebook')
         self.s.transition(run,CID,VID,'arm')
         self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
-        self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete')
+        with self.assertRaisesRegex(ytg.Stop, 'registered Gemini Notebook'):
+            self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','公德观','youtube-content-complete-notebook')
         title=ytg.title_for(self.s.video(CID,VID))
         with self.assertRaises(ytg.Stop): self.s.transition(run,CID,VID,'renamed','wrong')
         self.s.transition(run,CID,VID,'renamed',title)
@@ -146,7 +148,7 @@ class QueueTests(unittest.TestCase):
             vid=item['id']
             self.s.transition(run,CID,vid,'arm')
             self.s.transition(run,CID,vid,'attach','https://gemini.google.com/app/'+f'{i:016x}','video-match')
-            self.s.transition(run,CID,vid,'summary','\u4e3b\u9898','youtube-content-complete')
+            self.s.transition(run,CID,vid,'summary','\u4e3b\u9898','youtube-content-complete-notebook')
             item=self.s.reserve(run)
             self.assertEqual(item['id'],vid)
             self.assertEqual(item['phase'],'finalize')
@@ -160,7 +162,7 @@ class QueueTests(unittest.TestCase):
         run=self.claimed()
         self.s.transition(run,CID,VID,'arm')
         self.s.transition(run,CID,VID,'attach',CHAT,'video-match')
-        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete')
+        self.s.transition(run,CID,VID,'summary','\u4e3b\u9898','youtube-content-complete-notebook')
         self.video('aaaaaaaaaaa')
         self.expire()
         new=self.s.begin('history')['id']

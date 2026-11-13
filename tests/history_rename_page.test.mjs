@@ -85,6 +85,20 @@ test('chat evidence is found when Gemini renders messages in open shadow roots',
   assert.equal(result.summary_present,true);
 });
 
+test('chat-back accepts the localized notebook return control',async()=>{
+  const {job}=fixture();
+  const back={textContent:'',getAttribute:key=>key==='aria-label'?'返回到笔记本':null,getClientRects:()=>[{}],querySelectorAll:()=>[],clicked:false,click(){this.clicked=true;}};
+  globalThis.document.querySelectorAll=selector=>{
+    if(selector==='[aria-label]')return [];
+    if(selector==='.query-text')return [{textContent:`https://www.youtube.com/watch?v=${job.video_id}`,getClientRects:()=>[{}]}];
+    if(selector==='message-content')return [{textContent:'完整总结正文'.repeat(40),getClientRects:()=>[{}]}];
+    if(selector==='button,[role="button"],[role="link"],a')return [back];
+    return [];
+  };
+  assert.deepEqual(await pageAction('chat-back',{...job,identity_checked:true}),{clicked:true});
+  assert.equal(back.clicked,true);
+});
+
 test('title preview cancels and rename saves the exact full title then reads it back',async()=>{
   const {job,state}=fixture();
   assert.equal((await pageAction('chat-title',job)).title,'自动标题');

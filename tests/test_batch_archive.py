@@ -47,7 +47,7 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.s.transition(self.run,CID,item['id'],'arm')
         chat = 'https://gemini.google.com/app/'+f"{int(item['id']):016x}"
         self.s.transition(self.run,CID,item['id'],'attach',chat,'video-match')
-        return self.s.transition(self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete')
+        return self.s.transition(self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete-notebook')
 
     def archive(self,item,evidence=ytg.CURRENT_PAGE_EVIDENCE):
         if self.s.video(CID,item['id'])['state']=='summarized':
@@ -257,14 +257,14 @@ class PerVideoArchiveTests(unittest.TestCase):
         self.s.db.execute('UPDATE videos SET metadata_checked=?',(10000.,))
         self.s.transition(self.run,CID,item['id'],'arm')
         self.s.transition(self.run,CID,item['id'],'attach','https://gemini.google.com/app/aaaaaaaaaaaaaaaa','video-match')
-        result=ytg.advance(self.s,self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete')
+        result=ytg.advance(self.s,self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete-notebook')
         self.assertEqual(result['next']['id'],item['id'])
         self.archive(result['next'])
         self.assertEqual(self.count(),1)
         item=self.s.reserve(self.run)
         self.s.transition(self.run,CID,item['id'],'arm')
         self.s.transition(self.run,CID,item['id'],'attach','https://gemini.google.com/app/bbbbbbbbbbbbbbbb','video-match')
-        self.s.transition(self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete')
+        self.s.transition(self.run,CID,item['id'],'summary',TOPIC,'youtube-content-complete-notebook')
         self.s.transition(self.run,CID,item['id'],'defer','archive_unverified')
         self.assertEqual(self.count(),2)
 

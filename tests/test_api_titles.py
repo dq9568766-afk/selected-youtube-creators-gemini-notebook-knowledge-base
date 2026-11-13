@@ -1,5 +1,7 @@
 import os
 import tempfile
+import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +25,21 @@ class ApiTitleTests(unittest.TestCase):
     def tearDown(self):
         self.s.db.close()
         self.tmp.cleanup()
+
+    def test_windows_user_environment_replaces_stale_process_key(self):
+        class Key:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+        winreg = types.SimpleNamespace(
+            HKEY_CURRENT_USER=object(),
+            OpenKey=lambda *args: Key(),
+            QueryValueEx=lambda *args: ('new-user-key', 1),
+        )
+        with patch.dict(os.environ, {'YOUTUBE_DATA_API_KEY': 'expired-process-key'}), \
+             patch.object(ytg.os, 'name', 'nt'), \
+             patch.dict(sys.modules, {'winreg': winreg}):
+            self.assertEqual(ytg.youtube_data_api_key(), ('new-user-key', 'windows-user'))
 
     def api(self, title='\u539f\u6807\u9898', published='2026-06-01', channel=WANG):
         item = {'snippet': {'title': title, 'channelId': channel,
@@ -51,7 +68,8 @@ class ApiTitleTests(unittest.TestCase):
         with patch.dict(os.environ, {'YOUTUBE_DATA_API_KEY': KEY}):
             self.assertFalse(ytg.metadata_fresh(row))
         without = {k: v for k, v in os.environ.items() if k != 'YOUTUBE_DATA_API_KEY'}
-        with patch.dict(os.environ, without, clear=True):
+        with patch.dict(os.environ, without, clear=True), \
+             patch('ytg.youtube_data_api_key', return_value=(None, None)):
             self.assertTrue(ytg.metadata_fresh(row))
 
     def test_arming_is_blocked_while_the_title_is_unverified(self):
