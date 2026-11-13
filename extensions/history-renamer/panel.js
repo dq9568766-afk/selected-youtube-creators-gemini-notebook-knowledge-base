@@ -6,10 +6,18 @@ import {runWithRecovery} from './recovery.js';
 
 const $ = id => document.getElementById(id);
 let pairing, running = false, stopping = false, workTab, notebookTab, notebookUrl, channelName, accountName;
+let verifiedNotebookUrl;
 let heartbeatTimer, keepaliveTimer, heartbeatFailures=0;
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
 const status = text => { $('status').textContent = text; };
 function checkStop() { if (stopping) throw new Error('interrupted'); }
+function nativeErrorText(result) {
+  if (!result) return '';
+  if (typeof result === 'string') return result;
+  if (typeof result.error === 'string') return result.error;
+  if (result.error) return JSON.stringify(result.error);
+  return JSON.stringify(result);
+}
 
 async function api(path, body = {}) {
   if (!pairing) throw new Error('请先点击启动本机服务');
@@ -116,7 +124,7 @@ async function bindPairing(value, selected=null, mappingOnly=false) {
   let roster='';
   try {
     const r=await api('/collect',{items:[]});
-    roster=`\n名单：${r.report?.total||0} 条待改名`;
+    roster=`\n待改名：${r.report?.pending||0} 条（已完成 ${r.report?.chat_verified||0} 条）`;
   } catch { /* Keep the panel usable even if the roster probe fails. */ }
   $('mapping').textContent=`本机服务：已启动并已连接\n频道：${job.channel_name||'未登记名称'}\n账号：${job.account}\nGemini：${job.notebook}` + roster;
   status(mappingOnly ? '本机服务已启动并已连接。当前为重建映射模式，不领取批量改名项目。' : job.done
@@ -254,26 +262,23 @@ async function chat(job,preview,setPhase=()=>{}) {
   // The chat view does not expose the Google account button in the current
   // Gemini UI. Verify account + Notebook on the Notebook page first, then
   // carry that same-tab identity check into the chat inspection.
-  setPhase('打开登记笔记本');
-  await navigate(job.notebook);
-  setPhase('核对账号和笔记本');
-  await page('identity',job);
+  if (verifiedNotebookUrl !== job.notebook) {
+    setPhase('打开登记笔记本');
+    await navigate(job.notebook);
+    setPhase('核对账号和笔记本');
+    await page('identity',job);
+    verifiedNotebookUrl=job.notebook;
+  }
   const checkedJob = {...job,identity_checked:true};
   setPhase('打开历史聊天');
   await navigate(job.chat);
   setPhase('读取视频和总结结构');
   await page('chat-check',checkedJob);
-  // Follow the product's own return control to establish actual membership.
-  setPhase('验证聊天所属笔记本');
-  await page('chat-back',checkedJob,true);
-  await sleep(500);
-  await waitPage(job.notebook);
-  setPhase('重新核对笔记本');
-  await page('identity',job);
-  setPhase('重新打开历史聊天');
-  await navigate(job.chat);
   setPhase('读取当前聊天标题');
-  const old = await page('chat-title',checkedJob,true);
+  // Keep the rename modal open between reading the old title and saving it.
+  // Closing and reopening it was both slow and prone to losing the modal
+  // during Gemini's re-render.
+  const old = await page('chat-title',{...checkedJob,keep_dialog:!preview},true);
   if (preview) return;
   await api('/checkpoint',{video_id:job.video_id,old_chat_title:old.title});
   job.old_chat_title ||= old.title;
@@ -295,10 +300,20 @@ $('nativeStart').onclick=async()=>{
     if (!selected) { status('请先读取并选择目标频道的历史 run。'); return; }
     const choice=JSON.parse(selected);
     status('正在启动本机服务…');
-    // A previous task may have left a live Native Messaging port behind.
-    // Force a fresh host connection so its pairing belongs to this run.
-    let result=await native('start',{run:choice.run,resume:!choice.live,fresh:true});
-    if (!result?.ok) throw new Error(result?.error || '本机组件未安装');
+    // The candidate list can be stale: its lease may expire between reading
+    // the list and pressing this button.  Always repair only the selected run
+    // first, then reopen that same run so the bridge gets a new lease.
+    await native('cleanup',{run:choice.run});
+    pairing=null;
+    let result=await native('start',{run:choice.run,resume:true,fresh:true});
+    const startError=nativeErrorText(result);
+    if (!result?.ok && /Another worker owns the queue scope|rename bridge is already active|旧配对|pairing required/i.test(startError)) {
+      status('检测到旧任务占用，正在自动清理当前任务并恢复启动…');
+      await native('cleanup',{run:choice.run});
+      pairing=null;
+      result=await native('start',{run:choice.run,resume:true,fresh:true});
+    }
+    if (!result?.ok) throw new Error(nativeErrorText(result) || '本机组件未安装');
     try {
       // Starting the service must not claim a rename item. Mapping rebuilds
       // use the bridge before any batch item is eligible for /next.
@@ -307,12 +322,12 @@ $('nativeStart').onclick=async()=>{
       // The native host can return a pairing file from a dead/replaced bridge.
       // Repair only the explicitly selected run, then establish one fresh
       // session and validate it through /next before reporting success.
-      if (!String(error?.message || error).includes('pairing required')) throw error;
-      status('检测到旧配对会话，正在清理当前频道并重新连接…');
+      if (!/pairing required|Another worker owns the queue scope|rename bridge is already active/i.test(String(error?.message || error))) throw error;
+      status('检测到旧任务占用，正在自动清理当前任务并重新连接…');
       await native('cleanup',{run:choice.run});
       pairing=null;
       result=await native('start',{run:choice.run,resume:true,fresh:true});
-      if (!result?.ok) throw new Error(result?.error || '重新启动本机服务失败');
+      if (!result?.ok) throw new Error(nativeErrorText(result) || '重新启动本机服务失败');
       await bindPairing(result.pairing,choice,true);
     }
     $('nativeStop').disabled=false;
@@ -366,6 +381,7 @@ async function run(preview,one) {
   // The first navigation creates a fresh tab in the browser profile that
   // owns this extension; subsequent steps in this run reuse that tab only.
   workTab=undefined;
+  verifiedNotebookUrl=undefined;
   running=true; stopping=false;
   startHeartbeat();
   ['preview','one','start'].forEach(id=>$(id).disabled=true);
@@ -377,7 +393,7 @@ async function run(preview,one) {
       phase='领取名单';
       job=await api('/next');
       if (job.done) {
-        if (job.report && job.report.total === 0) {
+        if (job.report && job.report.pending === 0) {
           status('名单为空，请先点「重建映射」恢复视频与已有聊天的对应关系；本机服务保持连接。');
           break;
         }
@@ -392,6 +408,7 @@ async function run(preview,one) {
           ()=>chat({...job,recovery_attempts:recoveryAttempts},preview,value=>{phase=value;}),
           async(reason,attempt)=>{
             recoveryAttempts=attempt;
+            verifiedNotebookUrl=undefined;
             phase=`自动重开第${attempt}次（${messages[reason] || reason}）`;
             status(`${preview?'检查':'处理'}：${job.title}\n${phase}`);
             // The next chat attempt always starts at the registered Notebook.
@@ -441,7 +458,7 @@ $('stop').onclick=()=>{stopping=true;status('正在停止，将保留已登记�
 // Keep the project-wide 20-item cooling rule, while allowing the rebuild to
 // continue without any total per-round limit.
 const COOLDOWN_EVERY = 20;
-const COOLDOWN_MS = 40000;
+const COOLDOWN_MS = 30000;
 const rand = (min,max) => min + Math.random()*(max-min);
 const blockedUrl = url => /google\.com\/sorry|\/sorry\/index|captcha/i.test(String(url||''));
 async function slowSleep(ms) {
@@ -575,7 +592,8 @@ $('rebuild').onclick=async()=>{
   if (!pairing) {
     try {
       status('正在为重建映射启动本机服务…');
-      const result=await native('start',{run:choice.run,resume:!choice.live,fresh:true});
+      await native('cleanup',{run:choice.run});
+      const result=await native('start',{run:choice.run,resume:true,fresh:true});
       if (!result?.ok) throw new Error(result?.error || '本机组件未安装');
       await bindPairing(result.pairing,choice,true);
     } catch (error) {
@@ -616,7 +634,7 @@ $('rebuild').onclick=async()=>{
     const pending=(listed.chats||[]).filter(c=>!(c.chat && doneChats.has(c.chat)));
     const chats=listed.chats||[];
     if (!chats.length) throw new Error('no_unmapped_chats_in_channel');
-    status(`频道「${verifiedName}」可见 ${chats.length} 条来源，正在逐条核对视频 ID；待写入 ${unmappedVideoIds.size} 条。每 ${COOLDOWN_EVERY} 条冷却 40 秒。`);
+    status(`频道「${verifiedName}」可见 ${chats.length} 条来源，正在逐条核对视频 ID；待写入 ${unmappedVideoIds.size} 条。每 ${COOLDOWN_EVERY} 条冷却 30 秒。`);
     let batch=[];
     const flush=async()=>{
       if (!batch.length) return;
@@ -669,7 +687,7 @@ $('rebuild').onclick=async()=>{
       try { await api('/heartbeat'); } catch { /* timer heartbeat also renews */ }
       if ((i+1)%COOLDOWN_EVERY===0) {
         await flush();
-        status(`已处理 ${i+1} 条，冷却 40 秒以避免风控…`);
+          status(`已处理 ${i+1} 条，冷却 30 秒以避免风控…`);
         await slowSleep(COOLDOWN_MS);
       } else {
         await slowSleep(rand(8000,15000));

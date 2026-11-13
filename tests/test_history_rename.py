@@ -204,7 +204,7 @@ class HistoryRenameTests(unittest.TestCase):
         result=bridge.pace()
         self.assertFalse(result['ready'])
         self.assertEqual(result['kind'],'break')
-        self.assertGreater(result['seconds_remaining'],85)
+        self.assertGreater(result['seconds_remaining'],25)
 
     def test_local_http_pairing_origin_and_release(self):
         hr.enable(self.s,self.run); self.generate()

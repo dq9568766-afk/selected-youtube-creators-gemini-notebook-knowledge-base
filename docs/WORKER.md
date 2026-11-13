@@ -144,6 +144,8 @@ Gemini UI 动作（打开、刷新、搜索、提交、改名）开始时间相�
 
 增量每频道每个本地自然日最多20次提交意图（arm及同条retry各占一次），跨运行/重启累计；旧全局范围预算也计入，未知提交仍占预算，不能重开运行绕过。保留兼容单轮20次上限；历史无每日条数上限。预算耗尽后保留增量pending到次日，仍须当日成功扫描才可结束每日轮次并返回历史。end检查扫描和未完成项，outcome区分complete与budget_exhausted；扫描失败不能标当天完成，按网络/页面故障规则有限恢复或暂停。跨午夜的运行以实际提交日扣预算，并在结束前完成新一天扫描。
 
+每日增量采用目标模式 `complete_current_day`：自动化启动后不得在完成一次候选、一次频道或一次页面动作后主动结束。对每个已成功扫描的频道，循环执行 `prepare → 生成 → summary → 改名 → verify`，直到该 run 的 `run_candidates` 全部进入 `verified` 或明确延期/人工复核；随后继续下一个频道。只有遇到 WORKER 定义的全局阻塞、频道级暂停、提交预算耗尽或当天候选已全部结清，才结束本轮。结束前必须读取 `report --mode incremental`，确认当日候选数、verified、deferred 和 cleanup_required；历史 `legacy_backlog` 不得阻断目标模式，也不得计入当日候选。
+
 使用 `daily-candidates` 判断每日候选和 `daily_used`；该预检不排除暂停或租约。增量报告只统计当前北京时间当天 scheduled run 的 `run_candidates`，旧的 `history=0` 遗留量单独列为 `legacy_backlog`，不得作为当日新增或完成量。每天预算是本地队列策略，不代表Gemini官方额度。
 
 完成轮次用 end，切换增量用 park。连续处理时保持当前运行租约，不要因单条成功调用 `cleanup`；只有完成、用户明确停止、暂停、规定冷却或需要交接时才清理。暂停或暂时结束但仍有已生成积压时，用 `cleanup RUN` 释放本运行lease与reserved，保留未确认提交及暂停原因，其他频道状态不动。cleanup 不代表任务完成或服务恢复；再次开始会恢复已有任务。`status` 的 `pause` 字段表示全局暂停，`pauses` 字段列出各范围暂停；开始频道范围运行时只检查该频道及全局暂停。频道暂停使用 `pause REASON --channel CHANNEL_ID`，经授权恢复使用 `resume --confirmed --channel CHANNEL_ID`；全局暂停恢复仅使用不带频道的 `resume --confirmed`，不会清除频道暂停。

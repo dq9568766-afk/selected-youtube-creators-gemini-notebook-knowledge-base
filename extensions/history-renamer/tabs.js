@@ -1,7 +1,11 @@
 export async function openOrReuseTab(tabs, url, tabId) {
   if (tabId !== undefined && tabId !== null) {
     try {
-      await tabs.get(tabId);
+      const current = await tabs.get(tabId);
+      // Re-navigation to the same Gemini chat is not a refresh.  Gemini is
+      // an SPA and tabs.update({url}) discards the already-rendered dialog,
+      // which made the batch loop repeatedly reload the same item.
+      if (current?.url === url) return tabId;
       let lastError;
       for (let attempt=0; attempt<4; attempt++) {
         try {

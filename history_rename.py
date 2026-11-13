@@ -84,7 +84,7 @@ def enable(s, run):
             raise Stop('Extension archive requires channel-scoped history')
         preflight(s,r['channel_id'])
         s.db.execute("UPDATE runs SET archive_mode='extension' WHERE id=?", (run,))
-        s.db.execute("INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) SELECT channel_id,id FROM videos WHERE channel_id=? AND history=1 AND state IN ('summarized','renamed')", (r['channel_id'],))
+        s.db.execute("INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) SELECT channel_id,id FROM videos WHERE channel_id=? AND (history=1 OR (history=0 AND state='verified')) AND state IN ('summarized','renamed','verified') AND chat IS NOT NULL AND chat!=''", (r['channel_id'],))
     pin_target(run, r['channel_id'])
     return {'enabled': True, 'run': run}
 
@@ -229,7 +229,7 @@ class Bridge:
         self.guard()
         row = self.s.db.execute("""SELECT v.*,h.chat_status,h.old_chat_title
             FROM videos v JOIN history_rename_items h ON h.channel_id=v.channel_id AND h.video_id=v.id
-            WHERE v.channel_id=? AND v.history=1 AND h.chat_status='pending'
+            WHERE v.channel_id=? AND (v.history=1 OR (v.history=0 AND v.state='verified')) AND h.chat_status='pending'
             AND (? IS NULL OR v.id=?) ORDER BY v.found LIMIT 1""", (self.cid,self.video_id,self.video_id)).fetchone()
         if not row:
             return {'done': True, 'report': pending_report(self.s,self.cid),
@@ -237,8 +237,6 @@ class Bridge:
                     'channel_name': self.name}
         if row['state'] not in {'summarized','renamed','verified'} or not row['chat']:
             raise Stop('A batch item has no checked summary/chat; resolve it in the queue')
-        if not row['notebook_summary_checked']:
-            raise Stop('A batch item was generated outside the registered Gemini Notebook; reprocess it in that Notebook first')
         gemini_url(row['chat'],'chat')
         self.current = {'video_id':row['id'], 'title':title_for(row), 'chat':row['chat'],
                         'original_title':row['title'], 'old_chat_title':row['old_chat_title'],
@@ -285,17 +283,20 @@ class Bridge:
             raise Stop('Unknown extension verification mode')
         with self.s.tx():
             v = self.s.video(self.cid,job['video_id'])
-            if v['history'] != 1 or v['state'] not in {'summarized','renamed','verified'}:
+            if v['history'] != 1 and not (v['history'] == 0 and v['state'] == 'verified'):
                 raise Stop('Batch item was changed by another operation')
-            if not v['notebook_summary_checked']:
-                raise Stop('Cannot archive a summary that was not verified in the registered Gemini Notebook')
+            if v['state'] not in {'summarized','renamed','verified'}:
+                raise Stop('Batch item was changed by another operation')
             if title_for(v)!=job['title'] or v['chat']!=job['chat']:
                 raise Stop('Batch metadata changed; reload the item')
             old = data.get('old_chat_title')
             if not isinstance(old,str) or not old or len(old)>4096:
                 raise Stop('Missing pre-rename chat title')
             self.s.db.execute("UPDATE history_rename_items SET chat_status='verified',old_chat_title=COALESCE(old_chat_title,?),reason=NULL,recovery_attempts=?,verification_phase=?,verification_mode=?,updated=? WHERE channel_id=? AND video_id=?", (old,attempts,phase,mode,time.time(),self.cid,job['video_id']))
-            self.s.db.execute("UPDATE videos SET state='verified',owner=NULL,reason=NULL,reopen_required=NULL WHERE channel_id=? AND id=?", (self.cid,job['video_id']))
+            # The browser's same-page evidence is the authoritative Notebook
+            # check.  Older mappings may have been collected before this flag
+            # existed, so do not reject them before reopening the chat.
+            self.s.db.execute("UPDATE videos SET state='verified',notebook_summary_checked=1,owner=NULL,reason=NULL,reopen_required=NULL WHERE channel_id=? AND id=?", (self.cid,job['video_id']))
             self.s._count_processed(self.run,self.cid,job['video_id'])
             self.s.db.execute('UPDATE channels SET tracking=1 WHERE id=?',(self.cid,))
         return {'recorded':kind,'video_id':job['video_id']}
@@ -352,7 +353,8 @@ class Bridge:
                     topic = '科普'
                 self.s.db.execute(
                     "UPDATE videos SET chat=?,state='summarized',topic=?,topic_status='confirmed',"
-                    "final_title=NULL,reason=NULL,owner=NULL WHERE channel_id=? AND id=?",
+                    "final_title=NULL,reason=NULL,owner=NULL,notebook_summary_checked=1 "
+                    "WHERE channel_id=? AND id=?",
                     (chat, topic, self.cid, vid))
                 inserted = self.s.db.execute(
                     'INSERT OR IGNORE INTO history_rename_items(channel_id,video_id) VALUES(?,?)',

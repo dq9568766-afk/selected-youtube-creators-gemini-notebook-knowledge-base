@@ -429,23 +429,59 @@ globalThis.__dqImpl = async function (action, args) {
     }
     return {clicked:true};
   }
+  const renameFieldSelector = 'input[type="text"],input:not([type]),textarea,[contenteditable="true"]';
+  const findRenameDialog = () => {
+    const standard = all('[role="dialog"],[aria-modal="true"]')
+      .find(el => all(renameFieldSelector,el).length === 1);
+    if (standard) return standard;
+    // Current Gemini build renders this modal without role=dialog or
+    // aria-modal. Its stable visible marker is the heading “重命名此对话”;
+    // walk upward to the smallest overlay containing the title field and
+    // the Rename/重命名 action.
+    const heading = all('*').filter(el => {
+      const text=norm(deepText(el));
+      return visible(el) && (text === '重命名此对话' || text === 'Rename this conversation');
+    }).sort((a,b) => (a.getClientRects()[0]?.width||999999)*(a.getClientRects()[0]?.height||999999)
+      - (b.getClientRects()[0]?.width||999999)*(b.getClientRects()[0]?.height||999999))[0];
+    for (let box=heading; box; box=box.parentElement) {
+      const fields=all(renameFieldSelector,box);
+      const actions=all('button,[role="button"],button mat-button',box)
+        .map(label).filter(text => ['重命名','Rename','取消','Cancel'].includes(text));
+      if (fields.length === 1 && actions.length) return box;
+    }
+    return null;
+  };
   const openChatDialog = async () => {
+    // A failed previous attempt can leave the rename modal open.  Do not
+    // click the conversation menu again in that state; reuse the visible
+    // modal and let the caller retry the same item safely.
+    const existing = findRenameDialog();
+    if (existing) return existing;
     button(['打开对话操作菜单。','Open conversation actions menu.','Open conversation actions menu']).click();
     await wait(() => all('[role="menuitem"]').some(el => ['重命名','Rename'].includes(label(el))));
     button(['重命名','Rename']).click();
-    return wait(() => all('[role="dialog"]').find(el => all('input[type="text"],input:not([type])',el).length === 1));
+    return wait(findRenameDialog);
   };
-  const dialogField = dialog => one(all('input[type="text"],input:not([type])',dialog));
+  const dialogField = dialog => one(all(renameFieldSelector,dialog));
+  const fieldValue = field => field?.isContentEditable ? norm(field.textContent) : norm(field?.value || '');
   if (action === 'chat-title') {
     chatEvidence();
     const dialog = await openChatDialog();
-    const title = dialogField(dialog).value;
-    button(['取消','Cancel'],dialog).click();
+    const title = fieldValue(dialogField(dialog));
+    // Batch mode immediately follows this read with chat-rename.  Keep the
+    // same modal alive so Gemini does not re-render it between two actions.
+    // Preview mode still closes it because no mutation follows.
+    if (!args.keep_dialog) button(['取消','Cancel'],dialog).click();
     if (!title) throw new Error('ui_changed');
     return {title};
   }
   const setInput = (field,value) => {
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(field,value);
+    if (field.isContentEditable) {
+      field.textContent=value;
+    } else {
+      const proto = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto,'value').set.call(field,value);
+    }
     field.focus?.();
     const InputEventCtor = globalThis.InputEvent || Event;
     field.dispatchEvent(new InputEventCtor('input',{bubbles:true,composed:true,inputType:'insertText',data:value}));
@@ -455,10 +491,10 @@ globalThis.__dqImpl = async function (action, args) {
   if (action === 'chat-rename') {
     chatEvidence();
     const dialog = await openChatDialog();
-    if (dialogField(dialog).value !== args.old_chat_title && dialogField(dialog).value !== args.title) throw new Error('save_unverified');
+    if (fieldValue(dialogField(dialog)) !== args.old_chat_title && fieldValue(dialogField(dialog)) !== args.title) throw new Error('save_unverified');
     const field = dialogField(dialog);
     setInput(field,args.title);
-    if (field.value !== args.title) throw new Error('save_unverified');
+    if (fieldValue(field) !== args.title) throw new Error('save_unverified');
     const confirm = button(['重命名','Rename'],dialog);
     if (confirm.disabled || confirm.getAttribute('aria-disabled') === 'true') throw new Error('save_unverified');
     confirm.focus?.();

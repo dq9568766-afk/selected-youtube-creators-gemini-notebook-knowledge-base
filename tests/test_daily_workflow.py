@@ -192,6 +192,25 @@ class DailyWorkflowTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 2)
             self.assertNotIn('skipped', result)
 
+    def test_same_day_run_reuse_keeps_lease_for_candidate_processing(self):
+        old = self.add(1)
+        new = 'new00000001'
+        run = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')['id']
+
+        def fetch(url, *args, **kwargs):
+            if url.endswith('/videos'):
+                return {'channel_id': CID, 'entries': [
+                    {'id': old, 'title': '旧积压', 'upload_date': '20261029'},
+                    {'id': new, 'title': '新视频', 'upload_date': '20261030'},
+                ]}
+            return {'channel_id': CID, 'entries': []}
+
+        ytg.scan(self.s, CID, fetch=fetch, run=run)
+        reopened = self.s.begin('incremental', scheduled=True, channel_id=CID, policy='collect-first')
+        self.assertEqual(reopened['id'], run)
+        self.assertEqual(ytg.prepare(self.s, run)['id'], new)
+        self.s.cleanup(run)
+
     def test_recent_window_expands_when_date_boundary_is_not_reached(self):
         boundary = {'id': 'aaaaaaaaaaa', 'title': '边界视频', 'upload_date': '20261030'}
         first = lambda url, *a, **k: {

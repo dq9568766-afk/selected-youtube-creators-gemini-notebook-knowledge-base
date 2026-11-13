@@ -124,7 +124,10 @@ REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
            'source_unavailable','metadata_unavailable','live_not_ready','ambiguous_match','save_unverified'}
 GLOBAL_PAUSES = {'quota','login','captcha','ui_changed','network'}
 BREAK_EVERY = 20
-BREAK_SECONDS = 90
+# The extension and mapping rebuild use a cautious 20/30 trial pace. The
+# per-action coordinator hold remains 15 seconds.
+# ACCOUNT_COORDINATOR_HOLD remains 15 seconds between page action windows.
+BREAK_SECONDS = 30
 ACCOUNT_COORDINATOR_HOLD = 15
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
