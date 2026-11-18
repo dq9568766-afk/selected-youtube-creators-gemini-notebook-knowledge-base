@@ -103,7 +103,7 @@ python ytg.py history-pipeline --channel CHANNEL_ID --full
 5. 首次20秒检查无正文且当前页面可见原消息、确认已提交时，停止生成并确认已停止（已自然结束则核对无生成中状态）。停止确认时若正文已出现，完整则归档，未完整则延期。仍无正文且当前页面未跳转或中断时，若策略允许同聊天再试，第二次提交前先将模型切换为当前选项之外的另一个模型：“3.5 Flash-Lite极速回答 推理中”与“3.8 Flash全方位帮助”互换；核对页面显示已选中目标模型后，再点击已发送消息上的“修改提示”，将“总结”改为“请总结”或将“请总结”改为“总结”，提交修改后的消息。不得在输入框原样重发或另发新消息。模型选择及提示编辑等非提交页面动作按账号时间槽规则执行；发送前执行 `step RUN CHANNEL VIDEO retry --evidence EVIDENCE` 登记意图：已attach时使用 `20s-no-body-stopped-same-chat`，尚无地址且状态仍为submitting时使用 `20s-no-body-stopped-current-page`。若原消息未确认、页面跳转/中断、账号或Notebook归属不明，或无法确认模型切换，不修改或再次提交，按相应规则延期或恢复。retry成功后从实际提交重新计20秒，只检查一次；如获得稳定聊天地址且原请求匹配，使用 `attach --value CHAT_URL --evidence video-match`。若没有地址，保持submitting直到获得地址或延期，不凭空登记提交成功；完整生成仍无法登记地址记chat_unidentified，不能summary或计成功。未完成则停止并确认后记generation_timeout；再次提交是否发生无法确认记submission_unconfirmed。retry_count持久化，每条最多两次提交；重试中断按未确认提交处理，不再重试。retry因增量预算耗尽被拒绝时直接延期，不绕过预算。
 6. 提交是否发生无法确认记 submission_unconfirmed；地址或聊天身份不明记 chat_unidentified；内容不匹配、拒答或仅复述标题记 content_failed。遇到程序能力拒绝或无正文时，只有满足上一步的同聊天重试条件才进行下一次尝试：先切换到另一个指定模型，再点击已发送消息上的“修改提示”，在“总结”前加“请”或去掉“请”，提交修改后的消息；不得原样重发或改用输入框另发。仍按本规程的提交次数、证据和延期规则执行。执行 `defer --value REASON --next` 后继续。首轮不搜索；延期后不自动再入队。超时仍有停止按钮时点击一次并核对已停止；无法停止、无法读回或无法建立下一条独立空白入口，进入有限浏览器恢复，失败则全局停止，不能继续并行提交。
 
-7. 方案1及每日增量：每条总结完成后立即改名并核验，核验成功或明确延期后立即处理下一条；历史方案2：总结阶段只核对完整总结并登记 `summary`，将 summarized 项留待扩展归档；总结阶段完成或用户明确要求立即批量改名后，再加载扩展处理改名和归档核验。用户未明确要求单条暂停时不得在这里结束 Goal 或调用 `cleanup`。`step RUN CHANNEL VIDEO summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；方案1按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`，再用 `step RUN CHANNEL VIDEO verify --value EXPECTED_TITLE --evidence current-page-video-summary --next` 推进。方案2可继续领取下一条生成；`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。`report` 的 `notebook_unverified` 必须为0，才能把生成数视为已归入登记 Notebook。已知失败/无效聊天不进入改名队列；在 Notebook 页面删除后，用 `step RUN CHANNEL VIDEO cleanup-invalid --evidence chat-deleted-in-notebook` 记录，`cleanup_required` 清零前不得报告清理完成。
+7. 方案1及每日增量：每条总结完成后立即改名并核验，核验成功或明确延期后立即处理下一条；历史方案2：总结阶段只核对完整总结并登记 `summary`，将 summarized 项留待扩展归档；总结阶段完成或用户明确要求立即批量改名后，再加载扩展处理改名和归档核验。用户未明确要求单条暂停时不得在这里结束 Goal 或调用 `cleanup`。`step RUN CHANNEL VIDEO summary --next` 返回当前 summarized 项及 expected_title，不领取下一条；方案1按 expected_title 改名后登记 `step RUN CHANNEL VIDEO renamed --value EXPECTED_TITLE`，再用 `step RUN CHANNEL VIDEO verify --value EXPECTED_TITLE --evidence current-page-video-summary --next` 推进。方案2可继续领取下一条生成；`finalize RUN` 也可领取当前或遗留归档项，优先完成 renamed 项；没有归档项返回 no_finalize，不创建新视频任务。`report` 的 `notebook_unverified` 必须为0，才能把生成数视为已归入登记 Notebook。已知失败/无效聊天不进入改名队列；先延期并保留 `cleanup_required`，不在单条处理中删除或询问用户。仅在频道历史项全部结清，或用户明确停止时，汇总 `cleanup_pending` 一次请求删除确认；确认后才逐条在 Notebook 删除，并用 `step RUN CHANNEL VIDEO cleanup-invalid --evidence chat-deleted-in-notebook` 记录。`cleanup_required` 未清零时不得报告清理完成。
 
 ## 共用改名、核验与休息
 
@@ -130,11 +130,15 @@ python ytg.py history-pipeline --channel CHANNEL_ID --full
 
 ## strict 兼容流程
 
+发送后若已看到原消息与“停止回答”，应记录为页面已显示生成开始。跳回普通 /app 且输入框回填时，无法确认的是聊天是否保存及其 Notebook 归属。不要在回填框发送。strict 历史恢复时，搜索无结果仅表示未找到；重新核对登记 Notebook 的空白入口，再凭 search-no-result 登记唯一一次重试。再次跳出或仍无法核验则转人工复核，不作第三次提交。
+
 strict 的首次生成观察时间调整为提交后至少20秒，与 collect-first 对齐。观察时页面若仍在生成，继续等待；未见正文不代表生成失败，不能仅因首次观察无正文就重发。strict 的 unknown_submit 按当前频道暂停；已登记聊天优先恢复。无聊天可找到时只按完整视频ID搜索一次，稳定无结果允许一次 retry --evidence search-no-result，不按原标题补搜、不再索要“确认旧任务”。已授权批量重生成可用 manual-review-regenerate；重试仍不能核验记 post_retry_unverified。仅连接YouTube且至少三次30秒检查无正文，可用 generation-timeout-youtube-connected 一次重试。其他来源故障连续3条仍按当前频道暂停。summary、renamed 证据要求保留；verify 按上面的共用规则选择当前页或必须重开核验。
 
 ## 共用节流、增量与清理
 
 Gemini UI 动作（打开、刷新、搜索、提交、改名）开始时间相隔至少15秒；不同视频提交至少间隔15秒。非提交动作前运行 `python ytg.py pace access --run RUN` 领取账号共享的时间槽；返回 `ready:false` 时仅等待 `seconds_remaining` 后重试该命令，返回 `ready:true` 后立即执行一个动作。提交动作由 `step ... arm` 或 `step ... retry` 原子领取时间槽；若返回 `ready:false`，不得发送，等待返回的秒数后重试原命令。提交/重试入口会再次检查全局和频道暂停，不能靠旧运行绕过暂停。账号协调权只覆盖当前页面动作窗口，不覆盖 Gemini 的生成等待；不同频道可以并行处于生成中，但所有页面动作和提交必须通过共享协调闸门。时间槽领取后即使网页操作失败也会消耗间隔。执行 `resume --confirmed` 后，账号门控对接下来3次新视频提交应用访问/提交30/180秒间隔；collect-first 同条快速重试豁免180秒提交间隔。上述间隔是项目保护参数，不是 Gemini 官方发布的网页端安全阈值。官方说明额度受提示复杂度、模型/功能及聊天长度影响，额度耗尽按页面提示的刷新时间等待；“短时间请求过多”应等待几分钟，通用高流量排障建议等待5分钟。恢复后仍由用户明确授权，页面核验后方可继续；已登记的未来quota刷新时间未到时，resume会拒绝清除全局暂停。15秒普通间隔、恢复期30/180秒、20条休息90秒暂时保留，待本机逐次发送记录积累后再评估；官方未公布网页端最小提交间隔或安全并发数。每次arm/retry在本机记录发送时间、频道、运行、视频、尝试类型及未结清提交数。未结清数包含未知、已提交未归档状态，不能解释为实际并行生成数；限流报告包含累计统计和最近30条。登记暂停时用 `pause quota|captcha|network|login`，可附 `--limit-type temporary_rate_limit|usage_exhausted|high_traffic|captcha|login_required|robot_suspected|service_error|unknown`；页面明确显示额度刷新时间时，quota可附带时区的 `--reset-at 2026-10-31T18:00:00+08:00`。无法判别时不猜，留空。quota、captcha、network及login暂停均保存账号内所有频道当时的活动快照。此流水不含提示正文、摘要、页面文本、Cookie或Token。collect-first生成检查20秒；strict首次观察也至少20秒。暂停/换轮/换频道不重置常规节流；时间或处理计数丢失先休息90秒。单工作标签串行，不为每条视频新建标签；仅保留 AGENT_ADAPTERS 中既有标签失效恢复例外。允许不同频道并行等待生成，不并行发起页面动作或补发积压动作。
+
+**短暂菜单的复合动作：** 对同一已展开的瞬时菜单完成的连续选择，例如“打开模型选择器 → 展开思考等级 → 选择高”，视为一个非提交页面动作窗口。窗口开始前只领取一次 `pace access`，随后立即完成该菜单链并读回最终选项；不得在子菜单之间等待15秒或再次领取时间槽。菜单外的下一次页面动作仍从该窗口开始时间起至少等待15秒。若菜单在操作前已自动关闭，放弃该窗口，等待下一时间槽后从打开菜单重新开始；不得在未读回最终值时提交。
 
 每天本地05:00后检查已启用跟踪的频道增量，本机时区应为Asia/Shanghai；每日调度按频道串行处理。预检只判断 `initialized=1`、`tracking=1`、时间窗和当天轮次，不排除历史未完成、暂停或有效租约。独立 scheduled incremental 允许运行，并可原子接管同频道历史租约；历史首轮完成规则仍只决定 tracking 的启用，不再阻止已启用频道的每日增量。交接保留频道、Notebook及共享节流；中断后可按已保存的run恢复；交接只负责数据库调度，浏览器由当前工作器串行操作。
 
@@ -168,7 +172,7 @@ manual_review包括所有延期项，列ID、原标题、原因、原视频链�
 - 用户要求换聊天时，交接说明只包含频道、Notebook登记标识、run、策略、历史Goal目标、最近完成视频、待处理状态、暂停/延期/未确认提交、daily_due与节流剩余时间；不得复制摘要正文或页面内容。
 - 禁止周期heartbeat。每日增量仍由原调度按频道串行执行。
 
-新聊天和每日增量统一使用 GPT-5.6 Luna，推理强度为低度。已延期且已转人工核对的历史会话，只有用户明确要求重新处理时，默认使用“3.5 Flash-Lite极速回答”，思考等级为高；该设置只适用于这类人工复核重处理，不适用于普通首轮、增量或自动重试。正常处理中只汇总批次进度；每个单条失败无需通知或提问。实际全局阻塞及时通知一次；状态无变化保持安静。CLI不是后台worker，不在结束后声称仍运行。
+新聊天和每日增量使用当前 Gemini 网页实际可见、已选定的常规模型，推理强度为低度；GPT 系列模型不属于 Gemini 网页的可选模型，不得把它作为该页面的前置条件或声称已选择。模型标签或版本变化时，以当前页面读回的选中常规模型与低思考等级为准；两者无法读回才延期，不猜测。已延期且已转人工核对的历史会话，只有用户明确要求重新处理时，默认使用“3.5 Flash-Lite极速回答”，思考等级为高；该设置只适用于这类人工复核重处理，不适用于普通首轮、增量或自动重试。正常处理中只汇总批次进度；每个单条失败无需通知或提问。实际全局阻塞及时通知一次；状态无变化保持安静。CLI不是后台worker，不在结束后声称仍运行。
 
 
 ## 历史日期补齐（可选）

@@ -41,6 +41,28 @@ class CollectFirstTests(unittest.TestCase):
         self.s.reserve(run)
         return run
 
+    def test_strict_history_lost_chat_recovery_only_once(self):
+        run = self.s.begin('history', channel_id=CID, policy='strict')['id']
+        self.s.reserve(run)
+        self.s.transition(run, CID, VID, 'arm')
+        self.s.transition(run, CID, VID, 'uncertain')
+        def retry():
+            return self.s.transition(run, CID, VID, 'retry', evidence='search-no-result')
+        with self.assertRaises(ytg.Stop):
+            retry()
+        self.s.cleanup(run)
+        self.s.clear_pause(CID)
+        self.s.begin('history', channel_id=CID, run_id=run)
+        item = retry()
+        self.assertEqual((item['state'], item['retry_count']), ('submitting', 1))
+        self.s.transition(run, CID, VID, 'uncertain')
+        self.s.clear_pause(CID)
+        with self.assertRaises(ytg.Stop):
+            retry()
+        deferred = self.s.transition(run, CID, VID, 'defer', 'post_retry_unverified')
+        self.assertEqual(deferred['state'], 'deferred')
+        self.assertEqual(self.s.video(CID, VID)['reason'], 'post_retry_unverified')
+
     def test_all_item_deferrals_allow_next_without_chat_or_retry(self):
         run = self.begin()
         for i, reason in enumerate(['generation_timeout', 'submission_unconfirmed', 'chat_unidentified',
@@ -88,11 +110,18 @@ class CollectFirstTests(unittest.TestCase):
         self.s.transition(run, CID, VID, 'arm')
         self.s.transition(run, CID, VID, 'attach', CHAT, 'video-match')
         self.s.transition(run, CID, VID, 'defer', 'content_failed')
-        self.assertEqual(self.s.report('history', CID)['cleanup_required'], 1)
+        report = self.s.report('history', CID)
+        self.assertEqual(report['cleanup_required'], 1)
+        self.assertEqual(report['cleanup_pending'], [{
+            'channel_id': CID, 'video_id': VID, 'reason': 'content_failed',
+            'chat': CHAT, 'url': 'https://www.youtube.com/watch?v='+VID,
+        }])
         with self.assertRaises(ytg.Stop):
             self.s.transition(run, CID, VID, 'cleanup-invalid', evidence='chat-deleted')
         self.s.transition(run, CID, VID, 'cleanup-invalid', evidence='chat-deleted-in-notebook')
-        self.assertEqual(self.s.report('history', CID)['cleanup_required'], 0)
+        cleaned = self.s.report('history', CID)
+        self.assertEqual(cleaned['cleanup_required'], 0)
+        self.assertEqual(cleaned['cleanup_pending'], [])
 
     def test_cooldown_and_probe_stop_survive_cleanup_and_new_run(self):
         run = self.begin()

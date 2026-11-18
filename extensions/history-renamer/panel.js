@@ -9,6 +9,17 @@ let pairing, running = false, stopping = false, workTab, notebookTab, notebookUr
 let verifiedNotebookUrl;
 let heartbeatTimer, keepaliveTimer, heartbeatFailures=0;
 const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
+// Minimum idle time between two consecutive page operations (read or navigate).
+const PAGE_GAP_MS = 10000;
+let lastPageActionAt = 0;
+async function pageGap() {
+  checkStop();
+  if (!lastPageActionAt) { lastPageActionAt = Date.now(); return; }
+  const elapsed = Date.now() - lastPageActionAt;
+  if (elapsed < PAGE_GAP_MS) await slowSleep(PAGE_GAP_MS - elapsed);
+  checkStop();
+  lastPageActionAt = Date.now();
+}
 const status = text => { $('status').textContent = text; };
 function checkStop() { if (stopping) throw new Error('interrupted'); }
 function nativeErrorText(result) {
@@ -145,6 +156,7 @@ async function pace() {
 
 async function page(action,job,mutation = false) {
   checkStop();
+  await pageGap();
   if (mutation) await pace();
   // Chrome MV3 serializes `func` via toString(). Injecting the long pageAction
   // function imported from an ES module silently returned result:null on this
@@ -220,6 +232,7 @@ async function waitPage(expected) {
 }
 
 async function navigate(url) {
+  await pageGap();
   await pace();
   if (workTab === undefined && accountName) {
     const candidates = await chrome.tabs.query({url:'https://gemini.google.com/*'});
@@ -458,7 +471,7 @@ $('stop').onclick=()=>{stopping=true;status('正在停止，将保留已登记�
 // Keep the project-wide 20-item cooling rule, while allowing the rebuild to
 // continue without any total per-round limit.
 const COOLDOWN_EVERY = 20;
-const COOLDOWN_MS = 30000;
+const COOLDOWN_MS = 40000;
 const rand = (min,max) => min + Math.random()*(max-min);
 const blockedUrl = url => /google\.com\/sorry|\/sorry\/index|captcha/i.test(String(url||''));
 async function slowSleep(ms) {
@@ -634,7 +647,7 @@ $('rebuild').onclick=async()=>{
     const pending=(listed.chats||[]).filter(c=>!(c.chat && doneChats.has(c.chat)));
     const chats=listed.chats||[];
     if (!chats.length) throw new Error('no_unmapped_chats_in_channel');
-    status(`频道「${verifiedName}」可见 ${chats.length} 条来源，正在逐条核对视频 ID；待写入 ${unmappedVideoIds.size} 条。每 ${COOLDOWN_EVERY} 条冷却 30 秒。`);
+    status(`频道「${verifiedName}」可见 ${chats.length} 条来源，正在逐条核对视频 ID；待写入 ${unmappedVideoIds.size} 条。每 ${COOLDOWN_EVERY} 条冷却 40 秒。`);
     let batch=[];
     const flush=async()=>{
       if (!batch.length) return;
@@ -687,7 +700,7 @@ $('rebuild').onclick=async()=>{
       try { await api('/heartbeat'); } catch { /* timer heartbeat also renews */ }
       if ((i+1)%COOLDOWN_EVERY===0) {
         await flush();
-          status(`已处理 ${i+1} 条，冷却 30 秒以避免风控…`);
+          status(`已处理 ${i+1} 条，冷却 40 秒以避免风控…`);
         await slowSleep(COOLDOWN_MS);
       } else {
         await slowSleep(rand(8000,15000));

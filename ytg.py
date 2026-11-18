@@ -124,11 +124,10 @@ REASONS = {'quota','login','captcha','ui_changed','network','unknown_submit',
            'source_unavailable','metadata_unavailable','live_not_ready','ambiguous_match','save_unverified'}
 GLOBAL_PAUSES = {'quota','login','captcha','ui_changed','network'}
 BREAK_EVERY = 20
-# The extension and mapping rebuild use a cautious 20/30 trial pace. The
-# per-action coordinator hold remains 15 seconds.
-# ACCOUNT_COORDINATOR_HOLD remains 15 seconds between page action windows.
+# The extension and mapping rebuild use a cautious 20/30 trial pace. Normal
+# page action windows are spaced by 10 seconds; recovery backoff remains longer.
 BREAK_SECONDS = 30
-ACCOUNT_COORDINATOR_HOLD = 15
+ACCOUNT_COORDINATOR_HOLD = 10
 REOPEN_REASONS = {'operation_error','page_interrupted','title_not_updated','membership_unclear'}
 REOPEN_EVIDENCE = {'reopen-video-summary','reload-notebook-reopen-video-summary','reload-notebook-reopen-marker-summary'}
 CURRENT_PAGE_EVIDENCE = 'current-page-video-summary'
@@ -850,7 +849,7 @@ class Store:
         """Explicitly requeue deferred historical summaries for human review."""
         self.channel(cid)
         allowed = set(reasons or {'generation_timeout','content_failed','chat_unidentified'})
-        if not allowed or not allowed <= {'generation_timeout','content_failed','chat_unidentified'}:
+        if not allowed or not allowed <= {'generation_timeout','content_failed','chat_unidentified','submission_unconfirmed'}:
             raise Stop('Unsupported manual-review reason')
         marks=','.join('?'*len(allowed))
         with self.tx():
@@ -1020,13 +1019,13 @@ class Store:
                     raise Stop('Paused: '+reason)
             self.db.execute("INSERT OR IGNORE INTO browser_pacing(scope) VALUES('gemini-account')")
             row=self.db.execute("SELECT * FROM browser_pacing WHERE scope='gemini-account'").fetchone()
-            access_interval=30 if row['recovery_remaining'] else 15
+            access_interval=30 if row['recovery_remaining'] else 10
             eligible=max(row['last_access']+access_interval,
-                         row['last_submit']+15 if kind=='submit' else 0)
+                         row['last_submit']+10 if kind=='submit' else 0)
             remaining=max(math.ceil(eligible-at),self._coordinator_wait(owner,at))
             if remaining:
                 return {'ready':False,'seconds_remaining':remaining,'kind':kind}
-            self._coordinator_grant(owner,kind,at,max(access_interval,15))
+            self._coordinator_grant(owner,kind,at,max(access_interval,10))
             self.db.execute("UPDATE browser_pacing SET last_access=?,last_submit=CASE WHEN ?='submit' THEN ? ELSE last_submit END WHERE scope='gemini-account'",
                             (at,kind,at))
             return {'ready':True,'kind':kind}
@@ -1037,8 +1036,8 @@ class Store:
         row=self.db.execute("SELECT * FROM browser_pacing WHERE scope='gemini-account'").fetchone()
         at=time.time()
         recovering=row['recovery_remaining']>0
-        access_interval=15 if recovery_retry_exempt else (30 if recovering else 15)
-        submit_interval=180 if recovering and not recovery_retry_exempt else 15
+        access_interval=10 if recovery_retry_exempt else (30 if recovering else 10)
+        submit_interval=180 if recovering and not recovery_retry_exempt else 10
         eligible=max(row['last_access']+access_interval,row['last_submit']+submit_interval)
         remaining=max(math.ceil(eligible-at),self._coordinator_wait(owner,at))
         if remaining:
@@ -1339,8 +1338,15 @@ class Store:
                 attached = v['state']=='submitted' and v['chat'] and evidence=='20s-no-body-stopped-same-chat'
                 current_page = (v['state']=='submitting' and not v['chat'] and
                                 evidence=='20s-no-body-stopped-current-page')
-                if (current_run['policy']!='collect-first' or not (attached or current_page)
-                        or v['retry_count']!=0 or v['reopen_required']):
+                strict_recovery = (
+                    current_run['policy']=='strict' and current_run['mode']=='history'
+                    and current_run['channel_id']==cid and v['history']
+                    and v['state']=='uncertain' and v['reason']=='unknown_submit'
+                    and not v['chat'] and evidence=='search-no-result'
+                )
+                fast_retry = (current_run['policy']=='collect-first' and
+                              (attached or current_page) and not v['reopen_required'])
+                if v['retry_count']!=0 or not (strict_recovery or fast_retry):
                     raise Stop('Retry requires confirmed first request, stopped generation, uninterrupted page and no prior retry')
                 if current_run['mode']=='incremental':
                     if current_run['armed']>=20 or self.budget_used(cid)>=20:
@@ -1426,8 +1432,14 @@ class Store:
                 allowed=COLLECT_REASONS if collect else {
                     'generation_timeout','submission_unconfirmed','chat_unidentified',
                     'content_failed','source_unavailable','metadata_unavailable',
-                    'live_not_ready','archive_unverified'
+                    'live_not_ready','archive_unverified','post_retry_unverified'
                 }
+                if value=='post_retry_unverified' and not (
+                    current_run['policy']=='strict' and current_run['mode']=='history'
+                    and current_run['channel_id']==cid and v['history']
+                    and v['state']=='uncertain' and v['retry_count']==1
+                ):
+                    raise Stop('Require an unconfirmed historical submission after the recovery retry')
                 if value not in allowed:
                     raise Stop('Unknown deferral reason')
                 if v['state'] not in {'reserved','submitting','submitted','uncertain','summarized','renamed'}:
@@ -1615,7 +1627,18 @@ class Store:
         rename_pending_ids = {row[0] for row in self.db.execute("SELECT video_id FROM history_rename_items WHERE chat_status='pending'"+(' AND channel_id=?' if channel_id else ''),(channel_id,) if channel_id else ())} if mode=='history' else set()
         notebook_unverified = sum(1 for row in rows if row['state'] in {'summarized','renamed','verified'} and not row['notebook_summary_checked'])
         notebook_verified = sum(1 for row in rows if row['state'] in {'summarized','renamed','verified'} and row['notebook_summary_checked'])
-        cleanup_required = sum(1 for row in rows if row['state']=='deferred' and row['chat'] and row['chat_cleanup_status']!='verified')
+        cleanup_pending = [
+            {
+                'channel_id': row['channel_id'],
+                'video_id': row['id'],
+                'reason': row['reason'],
+                'chat': row['chat'],
+                'url': 'https://www.youtube.com/watch?v='+row['id'],
+            }
+            for row in rows
+            if row['state']=='deferred' and row['chat'] and row['chat_cleanup_status']!='verified'
+        ]
+        cleanup_required = len(cleanup_pending)
         archive_review_ids={row['id'] for row in rows if row['state']=='deferred' and row['reason']=='archive_unverified'}
         archive_review_ids.update(item['video_id'] for item in rename_review)
         manual_review_count = sum(1 for row in rows if row['state']=='deferred' and row['reason']!='archive_unverified') + len(archive_review_ids)
@@ -1636,6 +1659,7 @@ class Store:
                  'notebook_verified':notebook_verified,
                  'notebook_unverified':notebook_unverified,
                  'cleanup_required':cleanup_required,
+                 'cleanup_pending':cleanup_pending,
                 'manual_review':review,'generated':generated,'summary_completed':generated,
                 'verified':counts.get('verified',0),
                 'not_generated':total-generated,'success_rate':generated/total if total else 0,

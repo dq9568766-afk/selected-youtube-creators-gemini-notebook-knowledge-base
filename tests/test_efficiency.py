@@ -133,7 +133,7 @@ class EfficiencyTests(unittest.TestCase):
         try:
             self.assertEqual(self.s.browser_access('access',at=1000),{'ready':True,'kind':'access'})
             self.assertEqual(other.browser_access('access',at=1005),
-                             {'ready':False,'seconds_remaining':10,'kind':'access'})
+                         {'ready':False,'seconds_remaining':5,'kind':'access'})
             self.assertEqual(other.browser_access('access',at=1015),{'ready':True,'kind':'access'})
         finally:
             other.db.close()
@@ -143,7 +143,7 @@ class EfficiencyTests(unittest.TestCase):
                          {'ready':True,'kind':'access'})
         blocked = self.s.browser_access('access', at=1001, owner='run-b')
         self.assertFalse(blocked['ready'])
-        self.assertGreaterEqual(blocked['seconds_remaining'], 14)
+        self.assertGreaterEqual(blocked['seconds_remaining'], 9)
         self.assertEqual(self.s.browser_access('access', at=1015, owner='run-b'),
                          {'ready':True,'kind':'access'})
         coordinator = self.s.coordinator_status(at=1015)
@@ -157,7 +157,7 @@ class EfficiencyTests(unittest.TestCase):
         self.s.transition(run, CID, item['id'], 'arm')
         coordinator = self.s.coordinator_status()
         self.assertEqual(coordinator['owner'], run)
-        self.assertGreaterEqual(coordinator['seconds_remaining'], 14)
+        self.assertGreaterEqual(coordinator['seconds_remaining'], 9)
         self.assertFalse(self.s.coordinator_status(at=time.time()+16)['active'])
 
     def test_recovery_gate_uses_longer_access_interval(self):
@@ -175,7 +175,7 @@ class EfficiencyTests(unittest.TestCase):
         base=self.s.db.execute("SELECT last_submit FROM browser_pacing WHERE scope='gemini-account'").fetchone()[0]
         with patch('ytg.time.time',return_value=base+1):
             result=self.s.transition(run,CID,VID,'retry',evidence='20s-no-body-stopped-same-chat')
-        self.assertEqual(result,{'ready':False,'seconds_remaining':14,'kind':'submit'})
+        self.assertEqual(result,{'ready':False,'seconds_remaining':9,'kind':'submit'})
         self.assertEqual((self.s.video(CID,VID)['state'],self.s.video(CID,VID)['retry_count']),('submitted',0))
         self.assertEqual(self.s.db.execute('SELECT armed FROM runs').fetchone()[0],1)
 
