@@ -1510,8 +1510,6 @@ class Store:
             raise Stop('Handoff requires a channel-scoped run')
         cid=r['channel_id']
         if r['mode']=='history':
-            if not self.history_complete(cid):
-                raise Stop('history_pending: finish the channel history before incremental handoff')
             if not self.daily_due(cid):
                 raise Stop('Daily incremental is not due')
             self.park(run)

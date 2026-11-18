@@ -47,13 +47,14 @@ class DailyWorkflowTests(unittest.TestCase):
         self.assertEqual(ytg.prepare(self.s, restored['run']), {'stop':'empty'})
         self.assertFalse(self.s.status(False, CID)['daily_due'])
 
-    def test_due_incremental_does_not_preempt_remaining_history_tasks(self):
+    def test_due_incremental_handoffs_remaining_history_tasks(self):
         self.add(1,True)
         history=self.s.begin('history',channel_id=CID,policy='collect-first')['id']
         self.assertEqual(ytg.prepare(self.s,history)['stop'], 'daily_due')
         with patch.object(self.s, 'daily_due', return_value=True):
-            with self.assertRaisesRegex(ytg.Stop, 'history_pending'):
-                self.s.handoff(history)
+            daily = self.s.handoff(history)['run']
+        self.assertEqual(self.s.db.execute('SELECT mode FROM runs WHERE id=?', (daily,)).fetchone()[0], 'incremental')
+        self.assertEqual(self.s.db.execute('SELECT parent_run FROM runs WHERE id=?', (daily,)).fetchone()[0], history)
 
     def test_untracked_channel_is_not_daily_due(self):
         self.s.db.execute('UPDATE channels SET tracking=0 WHERE id=?', (CID,))
@@ -121,7 +122,7 @@ class DailyWorkflowTests(unittest.TestCase):
         self.assertEqual(self.s.pause_for(CID), 'unknown_submit')
         self.s.cleanup(run)
 
-    def test_history_handoff_is_allowed_only_after_history_completion(self):
+    def test_history_handoff_is_allowed_with_unfinished_history(self):
         history = self.s.begin('history', channel_id=CID, policy='collect-first')['id']
         with patch.object(self.s, 'daily_due', return_value=True):
             daily = self.s.handoff(history)['run']
