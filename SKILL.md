@@ -17,6 +17,8 @@ examples_en:
 
 # DQ 指定 YouTube 创作者视频知识库
 
+Codex 每日启动优先遵循 docs/AGENT_ADAPTERS.md 的“Codex 启动优先规则（2026-11-19）”：先 daily-candidates，再直接绑定 IAB。下文旧的 external Chrome、browser inventory 和无副作用交互门槛不适用于 Codex 每日增量。GetCursorPos 错误不能作为 IAB 不可用的证据。
+
 ## API 配置防误报
 
 Windows 环境变量可能在当前任务进程启动后才更新。读取 `YOUTUBE_DATA_API_KEY` 时必须先看当前进程环境变量，再回退到当前用户的 `HKCU\Environment`；不能只检查 `os.environ` 就报告 API 缺失。`python ytg.py preflight --channel CHANNEL_ID` 会给出 `youtube_data_api.configured/source/key`，只显示是否存在，不输出密钥。若当前进程已有候选值但官方 API 返回密钥无效或过期，必须再单独读取 `HKCU\Environment`，在新子进程中用该值验证一次；验证成功后，运行补齐命令时要显式注入 Windows 用户变量，不能让旧进程值覆盖它。候选配置仍须用官方 YouTube Data API 实际请求验证；401/403、配额和网络失败按 `docs/WORKER.md` 处理。

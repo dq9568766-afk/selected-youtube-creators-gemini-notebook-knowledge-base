@@ -1,6 +1,6 @@
 # 自动化入口
 
-启动顺序（优先于通用浏览器门槛）：第一条队列命令必须是 python ytg.py daily-candidates；空列表正常结束。有候选才进入 [@浏览器](plugin://browser@openai-bundled)。使用该插件当前安装版本 scripts/browser-client.mjs 的 file URL 在 node_repl 中导入 setupBrowserRuntime，保存其返回值 runtime=await setupBrowserRuntime({globals:globalThis})；用 await runtime.browsers.get('iab') 绑定插件自己的内置浏览器，再用 browser.tabs.list() 选择 Gemini 工作标签；没有合适标签时 browser.tabs.new() 后打开 https://gemini.google.com/app。首次页面仍在加载时等待目标账号可见。不要用 cua.getState() 的清单判断本插件是否可用。绑定失败按插件 bootstrap-troubleshooting 复用同一 runtime 检查一次；仍不可用则记录失败阶段。插件内 iab 是指定后端；禁止的 IAB 替代路径指绕过该插件的其他接口。
+启动顺序：先 python ytg.py daily-candidates；空列表结束。有候选时遵循 docs/AGENT_ADAPTERS.md 的“Codex 启动优先规则（2026-11-19）”，使用当前公开的 cua.getBrowser({id:'iab'}) 直接绑定，复用返回 browserId，无标签则在同一绑定创建后台标签。先打开 Gemini /app 确认账号与侧栏，再进入登记 Notebook。禁止用 cua.getState()、GetCursorPos 错误或桌面权限错误判定 IAB 不可用；禁止导入猜测的旧版浏览器脚本。加载观察和逐视频核验遵循 WORKER。
 
 WorkBuddy 连续处理时使用 [WORKBUDDY_RUNNER.md](WORKBUDDY_RUNNER.md) 作为持续运行入口；本文件补充频道策略和每日增量规则。Codex 每日增量使用内置浏览器插件，WorkBuddy继续使用其指定外部 Chrome。
 
